@@ -1322,9 +1322,9 @@ def generate_image(prompt, seed=None):
             print(f"ImageRouter returned status {resp.status_code}: {resp.text}")
             # If rate limited or other failure, fall back to Stable Horde (AI Horde)
             try:
-                # Only attempt fallback when an API key is available for Horde or when ImageRouter fails
+                # Use the filtered prompt for the fallback
                 print("Attempting fallback to Stable Horde (AI Horde) due to ImageRouter failure")
-                horde_img, horde_msg = call_ai_horde(prompt, seed)
+                horde_img, horde_msg = call_ai_horde(filtered_prompt, seed)
                 if horde_img:
                     return horde_img, horde_msg
             except Exception as e:
@@ -1392,7 +1392,7 @@ def call_ai_horde(prompt: str, seed: Optional[int] = None):
         if horde_key:
             headers["apikey"] = horde_key
 
-        # Construct the request body
+        # Construct the request body. Include seed if provided to aid reproducibility.
         body = {
             "reqtype": "image",
             "params": {
@@ -1407,57 +1407,102 @@ def call_ai_horde(prompt: str, seed: Optional[int] = None):
             },
             "prompt": prompt
         }
+        if seed is not None:
+            # Stable Horde may accept a seed parameter depending on backend
+            body['params']['seed'] = int(seed)
 
-        # Stable Horde text-image generation endpoint
-        url = "https://stablehorde.net/api/v2/generate/async"
+        # Try the async generate endpoint first
+        async_url = "https://stablehorde.net/api/v2/generate/async"
+        sync_url = "https://stablehorde.net/api/v2/generate"
 
-        resp = requests.post(url, json=body, headers=headers, timeout=60)
+        # POST to async endpoint
+        resp = requests.post(async_url, json=body, headers=headers, timeout=60)
         if resp.status_code not in (200, 202):
-            print(f"Stable Horde returned status {resp.status_code}: {resp.text}")
-            return None, f"Stable Horde error {resp.status_code}: {resp.text}"
+            # Try the synchronous endpoint as a fallback
+            print(f"Stable Horde async returned {resp.status_code}: {resp.text}; trying sync endpoint")
+            try:
+                sresp = requests.post(sync_url, json=body, headers=headers, timeout=120)
+                if sresp.status_code == 200:
+                    sdata = sresp.json()
+                    # try to extract image immediately
+                    if isinstance(sdata, dict) and sdata.get('generations'):
+                        gen = sdata['generations'][0]
+                        if gen.get('img'):
+                            img_bytes = base64.b64decode(gen['img'])
+                            output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
+                            output_path = os.path.join(OUTPUT_DIR, output_filename)
+                            with open(output_path, 'wb') as f:
+                                f.write(img_bytes)
+                            return output_filename, "Image generated via Stable Horde (sync)"
+                        elif gen.get('imgurl'):
+                            dl = requests.get(gen['imgurl'], timeout=30)
+                            if dl.status_code == 200:
+                                output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
+                                output_path = os.path.join(OUTPUT_DIR, output_filename)
+                                with open(output_path, 'wb') as f:
+                                    f.write(dl.content)
+                                return output_filename, "Image generated via Stable Horde (sync)"
+                    return None, f"Stable Horde sync returned no image: {sresp.text}"
+                else:
+                    return None, f"Stable Horde sync failed {sresp.status_code}: {sresp.text}"
+            except Exception as e:
+                print(f"Stable Horde sync attempt failed: {e}")
+                # fall through to report original async error
+                return None, f"Stable Horde async failed: {resp.status_code} {resp.text}"
 
         data = resp.json()
 
-        # The async endpoint returns a 'id' or 'task_id' - poll for result
-        task_id = data.get('id') or data.get('task_id') or data.get('id')
+        # The async endpoint should return a task id; poll with exponential backoff
+        task_id = data.get('id') or data.get('task_id') or data.get('hash') or data.get('job')
         if not task_id:
-            # sometimes the API returns immediate data
+            # immediate generation returned
             if isinstance(data, dict) and data.get('generations'):
                 gen = data['generations'][0]
                 if gen.get('img'):
-                    img_b64 = gen['img']
+                    img_bytes = base64.b64decode(gen['img'])
+                    output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
+                    output_path = os.path.join(OUTPUT_DIR, output_filename)
+                    with open(output_path, 'wb') as f:
+                        f.write(img_bytes)
+                    return output_filename, "Image generated via Stable Horde (immediate)"
                 elif gen.get('imgurl'):
                     dl = requests.get(gen['imgurl'], timeout=30)
                     if dl.status_code == 200:
-                        img_bytes = dl.content
                         output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
                         output_path = os.path.join(OUTPUT_DIR, output_filename)
                         with open(output_path, 'wb') as f:
-                            f.write(img_bytes)
-                        return output_filename, "Image generated via Stable Horde"
-                    else:
-                        return None, f"Failed to download Stable Horde image URL: {dl.status_code}"
-                else:
-                    return None, "Stable Horde response missing image"
-            else:
-                return None, "Stable Horde did not return a task id"
+                            f.write(dl.content)
+                        return output_filename, "Image generated via Stable Horde (immediate-url)"
+            return None, "Stable Horde did not return a task id or image"
 
-        # Poll for completion (short loop)
+        # Polling loop with exponential backoff
         status_url = f"https://stablehorde.net/api/v2/generate/status/{task_id}"
-        for _ in range(30):
-            time.sleep(2)
-            s = requests.get(status_url, headers=headers, timeout=30)
-            if s.status_code != 200:
+        backoff = 1.5
+        wait = 1.5
+        for attempt in range(18):
+            time.sleep(wait)
+            try:
+                s = requests.get(status_url, headers=headers, timeout=30)
+            except Exception as e:
+                print(f"Error polling Stable Horde status: {e}")
+                wait = min(wait * backoff, 10)
                 continue
+
+            if s.status_code != 200:
+                print(f"Status poll returned {s.status_code}: {s.text}")
+                wait = min(wait * backoff, 10)
+                continue
+
             sd = s.json()
-            state = sd.get('state') or sd.get('status')
-            if state in ('done', 'completed', 'finished'):
-                gens = sd.get('generations') or sd.get('data') or []
+            state = sd.get('state') or sd.get('status') or sd.get('job')
+            print(f"Stable Horde status ({task_id}): {state}")
+
+            if state in ('done', 'completed', 'finished', 'success'):
+                gens = sd.get('generations') or sd.get('data') or sd.get('generations', [])
                 if gens:
                     gen = gens[0]
                     if gen.get('img'):
-                        img_b64 = gen['img']
-                        img_bytes = base64.b64decode(img_b64)
+                        img_bytes = base64.b64decode(gen['img'])
                         output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
                         output_path = os.path.join(OUTPUT_DIR, output_filename)
                         with open(output_path, 'wb') as f:
@@ -1471,8 +1516,10 @@ def call_ai_horde(prompt: str, seed: Optional[int] = None):
                             with open(output_path, 'wb') as f:
                                 f.write(dl.content)
                             return output_filename, "Image generated via Stable Horde"
-                return None, "Stable Horde completed but no image found"
-            elif state in ('pending', 'processing', 'queued'):
+                return None, "Stable Horde reported done but no image found"
+
+            if state in ('pending', 'processing', 'queued', 'working'):
+                wait = min(wait * backoff, 10)
                 continue
 
         return None, "Stable Horde timed out waiting for image"
