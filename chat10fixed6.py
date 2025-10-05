@@ -486,11 +486,86 @@ def swap_face(source_face, source_img, target_path, output_path):
                                 except Exception:
                                     pass
 
-                        # If Success==True but no image returned, log and fall back
+                        # If Success==True but no image returned, try multipart /faceswap endpoint before falling back
                         if success_flag:
-                            print("RapidAPI reported Success but did not provide ResultImageUrl or embedded image; falling back to Face++")
+                            print("RapidAPI reported Success but did not provide ResultImageUrl or embedded image; attempting multipart /faceswap before falling back")
                         else:
-                            print("RapidAPI did not succeed or did not return a usable image (Success flag false or missing). Falling back to Face++")
+                            print("RapidAPI did not succeed or did not return a usable image; attempting multipart /faceswap before falling back")
+
+                        # --- Try multipart /faceswap (file upload) as a fallback ---
+                        try:
+                            rapid_url2 = f"https://{rapidapi_host}/faceswap"
+                            headers2 = {
+                                "x-rapidapi-key": rapidapi_key,
+                                "x-rapidapi-host": rapidapi_host
+                            }
+                            print(f"Attempting RapidAPI multipart faceswap at {rapid_url2}")
+                            with open(template_path, 'rb') as src_f, open(merge_image_path, 'rb') as tgt_f:
+                                files = {
+                                    'source': ('source.jpg', src_f, 'image/jpeg'),
+                                    'target': ('target.jpg', tgt_f, 'image/jpeg')
+                                }
+                                data2 = {
+                                    'MatchGender': str(match_gender).lower(),
+                                    'MaximumFaceSwapNumber': '0'
+                                }
+                                resp2 = requests.post(rapid_url2, headers=headers2, files=files, data=data2, timeout=90)
+
+                            print(f"RapidAPI multipart response status: {resp2.status_code}")
+                            try:
+                                j2 = resp2.json()
+                            except Exception:
+                                j2 = None
+
+                            if j2:
+                                print(f"RapidAPI multipart response keys: {list(j2.keys())}")
+                                result_url2 = j2.get("ResultImageUrl") or j2.get("result_url") or j2.get("result")
+                                if isinstance(result_url2, str) and result_url2.startswith("data:"):
+                                    data = result_url2.split(",", 1)[1]
+                                    img_bytes = base64.b64decode(data)
+                                    with open(output_path, 'wb') as out_f:
+                                        out_f.write(img_bytes)
+                                    print("RapidAPI multipart returned embedded base64 image; saved to output_path")
+                                    return output_path
+                                if isinstance(result_url2, str) and result_url2.startswith("http"):
+                                    try:
+                                        dl2 = requests.get(result_url2, timeout=60)
+                                        if dl2.status_code == 200:
+                                            with open(output_path, 'wb') as out_f:
+                                                out_f.write(dl2.content)
+                                            print("RapidAPI multipart returned image URL; downloaded and saved to output_path")
+                                            return output_path
+                                        else:
+                                            print(f"Failed to download RapidAPI multipart result URL: {dl2.status_code}")
+                                    except Exception as exd:
+                                        print(f"Error downloading RapidAPI multipart result URL: {exd}")
+
+                                # Try common base64 keys
+                                for key in ("ResultImageBase64", "ResultBase64", "result_base64", "image_base64"):
+                                    val = j2.get(key)
+                                    if isinstance(val, str) and val.strip():
+                                        try:
+                                            img_bytes = base64.b64decode(val)
+                                            with open(output_path, 'wb') as out_f:
+                                                out_f.write(img_bytes)
+                                            print(f"RapidAPI multipart returned base64 via key {key}; saved to output_path")
+                                            return output_path
+                                        except Exception:
+                                            pass
+
+                            # If API returned raw image bytes (no JSON) and status==200, save content
+                            if resp2.status_code == 200 and (resp2.headers.get('content-type', '').startswith('image') or not j2):
+                                try:
+                                    with open(output_path, 'wb') as out_f:
+                                        out_f.write(resp2.content)
+                                    print("RapidAPI multipart returned raw image content; saved to output_path")
+                                    return output_path
+                                except Exception as exw:
+                                    print(f"Failed to write multipart image content: {exw}")
+
+                            print("RapidAPI multipart attempt did not yield an image; falling back to Face++")
+                        except Exception as e:
+                            print(f"RapidAPI multipart faceswap attempt failed: {e}")
                 except Exception as e:
                     # RapidAPI request failed; we'll fall back to Face++ below
                     print(f"RapidAPI faceswap attempt failed with exception: {e}")
