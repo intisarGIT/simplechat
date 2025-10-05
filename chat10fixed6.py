@@ -102,7 +102,7 @@ class AppState:
         self.facepp_api_secret = os.getenv("FACEPP_API_SECRET", "")
         # RapidAPI (FaceSwap) credentials - primary faceswap service if provided
         self.rapidapi_key = os.getenv("RAPIDAPI_KEY", "")
-        self.rapidapi_host = os.getenv("RAPIDAPI_HOST", "faceswap-image-transformation-api1.p.rapidapi.com")
+        self.rapidapi_host = os.getenv("RAPIDAPI_HOST", "faceswap-image-transformation-api-free-api-face-swap.p.rapidapi.com")
         # Mistral API Key (use MISTRAL_API_KEY env var)
         self.mistral_api_key = os.getenv("MISTRAL_API_KEY", "")
     
@@ -408,12 +408,32 @@ def swap_face(source_face, source_img, target_path, output_path):
                         "x-rapidapi-host": alt_host_primary
                     }
                     print(f"Attempting RapidAPI (free) multipart faceswap at {alt_url_primary}")
-                    with open(template_path, 'rb') as src_f, open(merge_image_path, 'rb') as tgt_f:
-                        files_alt = {
-                            'source_image': ('source.jpg', src_f, 'image/jpeg'),
-                            'target_image': ('target.jpg', tgt_f, 'image/jpeg')
-                        }
-                        resp_alt = requests.post(alt_url_primary, headers=headers_alt, files=files_alt, timeout=120)
+                    # Build raw multipart body with explicit boundary to match provider expectations
+                    boundary = '---011000010111000001101001'
+                    try:
+                        with open(template_path, 'rb') as src_f, open(merge_image_path, 'rb') as tgt_f:
+                            src_bytes = src_f.read()
+                            tgt_bytes = tgt_f.read()
+
+                        parts = []
+                        parts.append(f"--{boundary}\r\n".encode('utf-8'))
+                        parts.append(b'Content-Disposition: form-data; name="source_image"; filename="source.jpg"\r\n')
+                        parts.append(b'Content-Type: image/jpeg\r\n\r\n')
+                        parts.append(src_bytes)
+                        parts.append(b"\r\n")
+                        parts.append(f"--{boundary}\r\n".encode('utf-8'))
+                        parts.append(b'Content-Disposition: form-data; name="target_image"; filename="target.jpg"\r\n')
+                        parts.append(b'Content-Type: image/jpeg\r\n\r\n')
+                        parts.append(tgt_bytes)
+                        parts.append(b"\r\n")
+                        parts.append(f"--{boundary}--\r\n".encode('utf-8'))
+                        body = b''.join(parts)
+
+                        headers_alt['Content-Type'] = f'multipart/form-data; boundary={boundary}'
+                        resp_alt = requests.post(alt_url_primary, headers=headers_alt, data=body, timeout=120)
+                    except Exception as rexc:
+                        print(f"Error preparing or sending raw multipart to RapidAPI (free): {rexc}")
+                        raise
 
                     print(f"RapidAPI (free) primary response status: {resp_alt.status_code}")
                     try:
@@ -450,7 +470,49 @@ def swap_face(source_face, source_img, target_path, output_path):
                 except Exception as e:
                     print(f"RapidAPI (free) primary attempt failed: {e}")
 
-                # Try the base64 JSON endpoint next
+                # Next, try the free RapidAPI provider with base64 payload (form-urlencoded)
+                try:
+                    alt_host_primary = "faceswap-image-transformation-api-free-api-face-swap.p.rapidapi.com"
+                    alt_url_primary = f"https://{alt_host_primary}/api/face-swap/create"
+                    headers_base64 = {
+                        "x-rapidapi-key": rapidapi_key,
+                        "x-rapidapi-host": alt_host_primary,
+                        "Content-Type": "application/x-www-form-urlencoded"
+                    }
+                    print(f"Attempting RapidAPI (free) base64 form call at {alt_url_primary}")
+                    payload_base64 = {
+                        'source': src_b64,
+                        'target': tgt_b64
+                    }
+                    resp_b64 = requests.post(alt_url_primary, data=payload_base64, headers=headers_base64, timeout=90)
+                    print(f"RapidAPI (free) base64 response status: {resp_b64.status_code}")
+                    try:
+                        j_b64 = resp_b64.json()
+                    except Exception:
+                        j_b64 = None
+
+                    if j_b64:
+                        print(f"RapidAPI (free) base64 response keys: {list(j_b64.keys())}")
+                        data_block = j_b64.get('data') or {}
+                        image_url_b64 = data_block.get('image_url') if isinstance(data_block, dict) else None
+                        if isinstance(image_url_b64, str) and image_url_b64.startswith('http'):
+                            dl_b64 = requests.get(image_url_b64, timeout=60)
+                            if dl_b64.status_code == 200:
+                                with open(output_path, 'wb') as out_f:
+                                    out_f.write(dl_b64.content)
+                                print("RapidAPI (free) base64 returned image_url; downloaded and saved to output_path")
+                                return output_path
+                            else:
+                                print(f"Failed to download RapidAPI (free) base64 image_url: {dl_b64.status_code}")
+                    else:
+                        try:
+                            print(f"RapidAPI (free) base64 resp.text: {resp_b64.text}")
+                        except Exception:
+                            pass
+                except Exception as e:
+                    print(f"RapidAPI (free) base64 attempt failed: {e}")
+
+                # If base64 form didn't succeed, fall back to provider-specific faceswapbase64 (if present)
                 rapid_url = f"https://{rapidapi_host}/faceswapbase64"
                 headers = {
                     "x-rapidapi-key": rapidapi_key,
@@ -638,20 +700,112 @@ def swap_face(source_face, source_img, target_path, output_path):
                                 tgt_url = upload_to_transfersh(merge_image_path)
                                 if src_url and tgt_url:
                                     try:
-                                        rapid_url3 = f"https://{rapidapi_host}/faceswap"
+                                        # Try free provider for URL-based using JSON then form then multipart text parts
+                                        alt_host_primary = "faceswap-image-transformation-api-free-api-face-swap.p.rapidapi.com"
+                                        alt_url_primary = f"https://{alt_host_primary}/api/face-swap/create"
                                         headers3 = {
                                             "x-rapidapi-key": rapidapi_key,
-                                            "x-rapidapi-host": rapidapi_host,
+                                            "x-rapidapi-host": alt_host_primary,
                                             "Content-Type": "application/json"
                                         }
-                                        payload3 = {
-                                            "TargetImageUrl": tgt_url,
-                                            "SourceImageUrl": src_url,
-                                            "MatchGender": match_gender,
-                                            "MaximumFaceSwapNumber": 0
-                                        }
-                                        print(f"Attempting RapidAPI URL-based faceswap at {rapid_url3} with target={tgt_url} source={src_url}")
-                                        resp3 = requests.post(rapid_url3, json=payload3, headers=headers3, timeout=120)
+                                        print(f"Attempting RapidAPI (free) URL-based faceswap at {alt_url_primary} with target={tgt_url} source={src_url}")
+
+                                        # 1) Try JSON body with source_image/target_image
+                                        try:
+                                            payload3 = {
+                                                'source_image': src_url,
+                                                'target_image': tgt_url
+                                            }
+                                            resp3 = requests.post(alt_url_primary, json=payload3, headers=headers3, timeout=120)
+                                            print(f"RapidAPI (free) URL-based (json) response status: {resp3.status_code}")
+                                            if resp3.status_code == 200:
+                                                try:
+                                                    j3 = resp3.json()
+                                                except Exception:
+                                                    j3 = None
+                                                if j3 and isinstance(j3.get('data'), dict) and j3['data'].get('image_url'):
+                                                    dl3 = requests.get(j3['data']['image_url'], timeout=120)
+                                                    if dl3.status_code == 200:
+                                                        with open(output_path, 'wb') as out_f:
+                                                            out_f.write(dl3.content)
+                                                        print("RapidAPI (free) URL-based returned image_url; downloaded and saved to output_path")
+                                                        return output_path
+                                            else:
+                                                try:
+                                                    print(f"RapidAPI (free) URL-based (json) resp.text: {resp3.text}")
+                                                except Exception:
+                                                    pass
+                                        except Exception as exj:
+                                            print(f"Error calling RapidAPI (free) URL-based (json): {exj}")
+
+                                        # 2) Try form-urlencoded with source_image/target_image
+                                        try:
+                                            headers_form = {
+                                                'x-rapidapi-key': rapidapi_key,
+                                                'x-rapidapi-host': alt_host_primary,
+                                                'Content-Type': 'application/x-www-form-urlencoded'
+                                            }
+                                            data_form = {'source_image': src_url, 'target_image': tgt_url}
+                                            resp3f = requests.post(alt_url_primary, data=data_form, headers=headers_form, timeout=120)
+                                            print(f"RapidAPI (free) URL-based (form) response status: {resp3f.status_code}")
+                                            try:
+                                                j3f = resp3f.json()
+                                            except Exception:
+                                                j3f = None
+                                            if j3f and isinstance(j3f.get('data'), dict) and j3f['data'].get('image_url'):
+                                                dl3f = requests.get(j3f['data']['image_url'], timeout=120)
+                                                if dl3f.status_code == 200:
+                                                    with open(output_path, 'wb') as out_f:
+                                                        out_f.write(dl3f.content)
+                                                    print("RapidAPI (free) URL-based (form) returned image_url; downloaded and saved to output_path")
+                                                    return output_path
+                                            else:
+                                                try:
+                                                    print(f"RapidAPI (free) URL-based (form) resp.text: {resp3f.text}")
+                                                except Exception:
+                                                    pass
+                                        except Exception as exf:
+                                            print(f"Error calling RapidAPI (free) URL-based (form): {exf}")
+
+                                        # 3) Try raw multipart text parts with boundary
+                                        try:
+                                            boundary = '---011000010111000001101001'
+                                            parts = []
+                                            parts.append(f"--{boundary}\r\n".encode('utf-8'))
+                                            parts.append(b'Content-Disposition: form-data; name="source_image"\r\n\r\n')
+                                            parts.append(src_url.encode('utf-8') if isinstance(src_url, str) else str(src_url).encode('utf-8'))
+                                            parts.append(b"\r\n")
+                                            parts.append(f"--{boundary}\r\n".encode('utf-8'))
+                                            parts.append(b'Content-Disposition: form-data; name="target_image"\r\n\r\n')
+                                            parts.append(tgt_url.encode('utf-8') if isinstance(tgt_url, str) else str(tgt_url).encode('utf-8'))
+                                            parts.append(b"\r\n")
+                                            parts.append(f"--{boundary}--\r\n".encode('utf-8'))
+                                            body = b''.join(parts)
+                                            headers_m = {
+                                                'x-rapidapi-key': rapidapi_key,
+                                                'x-rapidapi-host': alt_host_primary,
+                                                'Content-Type': f'multipart/form-data; boundary={boundary}'
+                                            }
+                                            resp3m = requests.post(alt_url_primary, headers=headers_m, data=body, timeout=120)
+                                            print(f"RapidAPI (free) URL-based (multipart-text) response status: {resp3m.status_code}")
+                                            try:
+                                                j3m = resp3m.json()
+                                            except Exception:
+                                                j3m = None
+                                            if j3m and isinstance(j3m.get('data'), dict) and j3m['data'].get('image_url'):
+                                                dl3m = requests.get(j3m['data']['image_url'], timeout=120)
+                                                if dl3m.status_code == 200:
+                                                    with open(output_path, 'wb') as out_f:
+                                                        out_f.write(dl3m.content)
+                                                    print("RapidAPI (free) URL-based (multipart-text) returned image_url; downloaded and saved to output_path")
+                                                    return output_path
+                                            else:
+                                                try:
+                                                    print(f"RapidAPI (free) URL-based (multipart-text) resp.text: {resp3m.text}")
+                                                except Exception:
+                                                    pass
+                                        except Exception as exm:
+                                            print(f"Error calling RapidAPI (free) URL-based (multipart-text): {exm}")
                                         print(f"RapidAPI URL-based response status: {resp3.status_code}")
                                         if resp3.status_code != 200:
                                             try:
