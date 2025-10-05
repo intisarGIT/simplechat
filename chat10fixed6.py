@@ -628,7 +628,64 @@ def swap_face(source_face, source_img, target_path, output_path):
                                     except Exception as exu:
                                         print(f"Error calling RapidAPI URL-based faceswap: {exu}")
                                 else:
-                                    print("Could not upload files to transfer.sh; skipping URL-based RapidAPI call")
+                                    print("Could not upload files to transfer.sh; attempting PUBLIC_BASE_URL fallback if available")
+                                    public_base = os.getenv("PUBLIC_BASE_URL", "").rstrip('/')
+                                    if public_base:
+                                        try:
+                                            # Copy files into OUTPUT_DIR so they are served under /images
+                                            pub_src_name = f"public_src_{uuid.uuid4()}.jpg"
+                                            pub_tgt_name = f"public_tgt_{uuid.uuid4()}.jpg"
+                                            pub_src_path = os.path.join(OUTPUT_DIR, pub_src_name)
+                                            pub_tgt_path = os.path.join(OUTPUT_DIR, pub_tgt_name)
+                                            shutil.copy(template_path, pub_src_path)
+                                            shutil.copy(merge_image_path, pub_tgt_path)
+                                            src_url = f"{public_base}/images/{pub_src_name}"
+                                            tgt_url = f"{public_base}/images/{pub_tgt_name}"
+                                            print(f"Using PUBLIC_BASE_URL for RapidAPI: source={src_url} target={tgt_url}")
+                                            try:
+                                                rapid_url3 = f"https://{rapidapi_host}/faceswap"
+                                                headers3 = {
+                                                    "x-rapidapi-key": rapidapi_key,
+                                                    "x-rapidapi-host": rapidapi_host,
+                                                    "Content-Type": "application/json"
+                                                }
+                                                payload3 = {
+                                                    "TargetImageUrl": tgt_url,
+                                                    "SourceImageUrl": src_url,
+                                                    "MatchGender": match_gender,
+                                                    "MaximumFaceSwapNumber": 0
+                                                }
+                                                print(f"Attempting RapidAPI URL-based faceswap at {rapid_url3} with target={tgt_url} source={src_url}")
+                                                resp3 = requests.post(rapid_url3, json=payload3, headers=headers3, timeout=120)
+                                                print(f"RapidAPI URL-based response status: {resp3.status_code}")
+                                                try:
+                                                    j3 = resp3.json()
+                                                except Exception:
+                                                    j3 = None
+
+                                                if j3:
+                                                    print(f"RapidAPI URL-based response keys: {list(j3.keys())}")
+                                                    success3 = j3.get("Success") if isinstance(j3.get("Success"), bool) else (str(j3.get("Success", "")).lower() == "true")
+                                                    msg3 = j3.get("Message") or ""
+                                                    print(f"RapidAPI URL-based Success: {success3}; Message: {msg3}")
+                                                    result_url3 = j3.get("ResultImageUrl")
+                                                    if isinstance(result_url3, str) and result_url3.startswith("http"):
+                                                        dl3 = requests.get(result_url3, timeout=120)
+                                                        if dl3.status_code == 200:
+                                                            with open(output_path, 'wb') as out_f:
+                                                                out_f.write(dl3.content)
+                                                            print("RapidAPI URL-based returned image URL; downloaded and saved to output_path")
+                                                            return output_path
+                                                        else:
+                                                            print(f"Failed to download RapidAPI URL-based result URL: {dl3.status_code}")
+                                                else:
+                                                    print("RapidAPI URL-based did not return JSON")
+                                            except Exception as exu:
+                                                print(f"Error calling RapidAPI URL-based faceswap: {exu}")
+                                        except Exception as cpe:
+                                            print(f"PUBLIC_BASE_URL fallback failed to prepare public files: {cpe}")
+                                    else:
+                                        print("PUBLIC_BASE_URL not configured; skipping URL-based RapidAPI call")
                             except Exception as ex_all:
                                 print(f"URL-based RapidAPI fallback failed: {ex_all}")
                         except Exception as e:
