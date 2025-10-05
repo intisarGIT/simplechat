@@ -1320,6 +1320,15 @@ def generate_image(prompt, seed=None):
         resp = requests.post(url, json=payload, headers=headers, timeout=60)
         if resp.status_code != 200:
             print(f"ImageRouter returned status {resp.status_code}: {resp.text}")
+            # If rate limited or other failure, fall back to Stable Horde (AI Horde)
+            try:
+                # Only attempt fallback when an API key is available for Horde or when ImageRouter fails
+                print("Attempting fallback to Stable Horde (AI Horde) due to ImageRouter failure")
+                horde_img, horde_msg = call_ai_horde(prompt, seed)
+                if horde_img:
+                    return horde_img, horde_msg
+            except Exception as e:
+                print(f"AI Horde fallback failed: {e}")
             return None, f"ImageRouter error {resp.status_code}: {resp.text}"
 
         data = resp.json()
@@ -1361,6 +1370,116 @@ def generate_image(prompt, seed=None):
         print(f"TRACEBACK: {traceback.format_exc()}")
         print("==================================")
         return None, f"Error generating image: {str(e)}"
+
+
+def call_ai_horde(prompt: str, seed: Optional[int] = None):
+    """Fallback image generation using Stable Horde (AI Horde) API.
+
+    Uses model 'juggernaut XL: realistic' with NSFW enabled and the
+    requested generation parameters: 512x768, 30 steps, guidance 7.5.
+    Returns (filename, message) on success or (None, error_message) on failure.
+    """
+    try:
+        print("Calling Stable Horde (AI Horde) fallback...")
+
+        # Build the payload per Stable Horde API (https://stablehorde.net/api/)
+        horde_key = app_state.horde_api_key if getattr(app_state, 'horde_api_key', None) else os.getenv('HORDE_API_KEY', '')
+        # It's possible to call the public endpoints without a key but results may vary.
+
+        headers = {
+            "Content-Type": "application/json"
+        }
+        if horde_key:
+            headers["apikey"] = horde_key
+
+        # Construct the request body
+        body = {
+            "reqtype": "image",
+            "params": {
+                "model": "juggernaut XL: realistic",
+                "steps": 30,
+                "cfg": 7.5,
+                "clip_skip": 1,
+                "width": 512,
+                "height": 768,
+                "sampler": "k_euler_a",
+                "nsfw": True,
+            },
+            "prompt": prompt
+        }
+
+        # Stable Horde text-image generation endpoint
+        url = "https://stablehorde.net/api/v2/generate/async"
+
+        resp = requests.post(url, json=body, headers=headers, timeout=60)
+        if resp.status_code not in (200, 202):
+            print(f"Stable Horde returned status {resp.status_code}: {resp.text}")
+            return None, f"Stable Horde error {resp.status_code}: {resp.text}"
+
+        data = resp.json()
+
+        # The async endpoint returns a 'id' or 'task_id' - poll for result
+        task_id = data.get('id') or data.get('task_id') or data.get('id')
+        if not task_id:
+            # sometimes the API returns immediate data
+            if isinstance(data, dict) and data.get('generations'):
+                gen = data['generations'][0]
+                if gen.get('img'):
+                    img_b64 = gen['img']
+                elif gen.get('imgurl'):
+                    dl = requests.get(gen['imgurl'], timeout=30)
+                    if dl.status_code == 200:
+                        img_bytes = dl.content
+                        output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
+                        output_path = os.path.join(OUTPUT_DIR, output_filename)
+                        with open(output_path, 'wb') as f:
+                            f.write(img_bytes)
+                        return output_filename, "Image generated via Stable Horde"
+                    else:
+                        return None, f"Failed to download Stable Horde image URL: {dl.status_code}"
+                else:
+                    return None, "Stable Horde response missing image"
+            else:
+                return None, "Stable Horde did not return a task id"
+
+        # Poll for completion (short loop)
+        status_url = f"https://stablehorde.net/api/v2/generate/status/{task_id}"
+        for _ in range(30):
+            time.sleep(2)
+            s = requests.get(status_url, headers=headers, timeout=30)
+            if s.status_code != 200:
+                continue
+            sd = s.json()
+            state = sd.get('state') or sd.get('status')
+            if state in ('done', 'completed', 'finished'):
+                gens = sd.get('generations') or sd.get('data') or []
+                if gens:
+                    gen = gens[0]
+                    if gen.get('img'):
+                        img_b64 = gen['img']
+                        img_bytes = base64.b64decode(img_b64)
+                        output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
+                        output_path = os.path.join(OUTPUT_DIR, output_filename)
+                        with open(output_path, 'wb') as f:
+                            f.write(img_bytes)
+                        return output_filename, "Image generated via Stable Horde"
+                    elif gen.get('imgurl'):
+                        dl = requests.get(gen['imgurl'], timeout=30)
+                        if dl.status_code == 200:
+                            output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
+                            output_path = os.path.join(OUTPUT_DIR, output_filename)
+                            with open(output_path, 'wb') as f:
+                                f.write(dl.content)
+                            return output_filename, "Image generated via Stable Horde"
+                return None, "Stable Horde completed but no image found"
+            elif state in ('pending', 'processing', 'queued'):
+                continue
+
+        return None, "Stable Horde timed out waiting for image"
+    except Exception as e:
+        print(f"Error calling Stable Horde: {e}")
+        print(traceback.format_exc())
+        return None, f"Error calling Stable Horde: {str(e)}"
 
 
 def generate_image_with_face_swap(response_text, seed=None):
@@ -1696,6 +1815,7 @@ class ApiSettings(BaseModel):
     facepp_api_secret: Optional[str] = ""
     rapidapi_key: Optional[str] = ""
     rapidapi_host: Optional[str] = ""
+    horde_api_key: Optional[str] = ""
     sd_model_path: Optional[str] = ""
     scheduler_type: Optional[str] = "dpm_2m_karras"
     guidance_scale: Optional[float] = 7.0
@@ -1720,6 +1840,9 @@ async def set_api_settings(settings: ApiSettings):
         app_state.rapidapi_key = settings.rapidapi_key
     if getattr(settings, 'rapidapi_host', None):
         app_state.rapidapi_host = settings.rapidapi_host
+    # Store Horde API key if provided
+    if getattr(settings, 'horde_api_key', None):
+        app_state.horde_api_key = settings.horde_api_key
     
     # Save generation settings
     app_state.scheduler_type = settings.scheduler_type
