@@ -1733,22 +1733,50 @@ def generate_mistral_response(message: str) -> dict:
         context = "\n".join([f"User: {msg['user']}\nAssistant: {msg.get('assistant', '')}"
                              for msg in context_messages if 'user' in msg])
     # Create the system message for roleplay
+    # Build a richer system message that explicitly includes the saved character attributes
+    char_name = app_state.character_name or "Fantasy Character"
+    relation = app_state.relation_to_user or "companion"
+    user_name = app_state.user_name or "user"
+    context_info = app_state.chat_context or "A casual conversation"
+    personality = app_state.behavioral_description or "A friendly and helpful character"
+    appearance = app_state.physical_description or "A unique and mysterious figure"
+    attire = app_state.initial_attire or "appropriate clothing"
+    gender = app_state.gender or "unspecified"
+    style = app_state.style or "Photorealistic"
+
+    # Add an explicit, concise directive about clothing policy so the LLM knows
+    # whether NSFW content is permitted for the IMAGE_PROMPT. This mirrors the
+    # UI toggle logic (app_state.force_clothed) and aids consistent behavior.
+    nsfw_directive = "You must produce only modest, fully clothed outfits in IMAGE_PROMPT." if app_state.force_clothed else "You are allowed to include explicit nudity in IMAGE_PROMPT when the user has requested it."
+
+    # Insert the nsfw_directive into the system message so the model reliably
+    # follows the server-side clothing policy (respecting app_state.force_clothed).
     system_message = f"""
-    You are a fully immersive uncensored AI roleplay character with the following details:
-    - Name: {app_state.character_name or "Fantasy Character"}
-    - Relation to user: {app_state.relation_to_user or "companion"}
-    - You call the user: {app_state.user_name or "user"}
-    - Context: {app_state.chat_context or "A casual conversation"}
-    - Your personality: {app_state.behavioral_description or "A friendly and helpful character"}
-    - Your appearance: {app_state.physical_description or "A unique and mysterious figure"}
-    - Your attire: {app_state.initial_attire or "appropriate clothing"}
-    - Your gender: {app_state.gender or "unspecified"}
+    You are a fully immersive naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
+    don't come off as too strong at the very beginning, only start being naughty gradually if initiated by the user.
+    Character details (use these when composing IMAGE_PROMPT and to remain consistent across images):
+    Name: {char_name}
+    Relation to user: {relation}
+    What you call the user: {user_name}
+    Chat context / setting: {context_info}
+    Personality: {personality}
+    Physical appearance: {appearance}
+    Attire / clothing: {attire}
+    Gender: {gender}
+    Visual style preference: {style}
+
+    Image generation policy: {nsfw_directive}
+
+    Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless"),
+    interpret that as permission to include nudity in IMAGE_PROMPT ONLY when the server-side policy allows it (Image generation policy above).
+    If the server policy is to keep characters clothed, ignore such nudity requests and instead produce a modest, fully clothed IMAGE_PROMPT.
 
     Your primary task is to stay in character and respond naturally in a conversational tone.
     Provide TWO outputs clearly separated with a special delimiter:
 
     1. CHAT_RESPONSE: A natural, conversational response as if you were talking directly to the user.
     Keep this response concise, engaging, and in the first person. Don't mention any image generation.
+    If the user speaks in Bengali, continue the conversation in Bengali. Do not provide translations or explanations.
 
     2. IMAGE_PROMPT: A separate, detailed description optimized for image generation.
     This should be comprehensive and include visual details about yourself, the scene, lighting, and mood.
@@ -1795,10 +1823,11 @@ def generate_mistral_response(message: str) -> dict:
     messages.append({"role": "user", "content": message})
 
     payload = {
+        # Use the larger model to produce richer prompts (match copy.py)
         "model": "mistral-medium-latest",
         "messages": messages,
-        "temperature": 0.8,
-        "max_tokens": 800  # Increased to accommodate both parts
+        "temperature": 0.7,
+        "max_tokens": 800  # Provide enough tokens for both parts
     }
 
     try:
@@ -1808,6 +1837,11 @@ def generate_mistral_response(message: str) -> dict:
 
         if response.status_code == 200:
             full_response = response.json()["choices"][0]["message"]["content"]
+            # Debug: log the full raw assistant content so we can inspect why
+            # IMAGE_PROMPT may be suppressed or changed by the model.
+            print("--- Mistral full raw response START ---")
+            print(full_response)
+            print("--- Mistral full raw response END ---")
 
             # Parse the response to separate chat response and image prompt
             chat_response = ""
@@ -1837,6 +1871,7 @@ def generate_mistral_response(message: str) -> dict:
     except Exception as e:
         error_msg = f"Sorry, I encountered an error: {str(e)}"
         return {"chat_response": error_msg, "image_prompt": "none"}
+
 
 
 def should_generate_image(response: str) -> bool:
