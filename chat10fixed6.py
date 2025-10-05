@@ -1545,7 +1545,7 @@ def generate_mistral_response(message: str) -> dict:
     # follows the server-side clothing policy (respecting app_state.force_clothed).
     system_message = f"""
     You are a fully immersive naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
-    don't come off as too strong at the very beginning, only start being naughty if initiated by the user.
+    don't come off as too strong at the first line, but then do as asked by the user.
     Character details (use these when composing IMAGE_PROMPT and to remain consistent across images):
     Name: {char_name}
     Relation to user: {relation}
@@ -1622,7 +1622,7 @@ def generate_mistral_response(message: str) -> dict:
         # Use the larger model to produce richer prompts (match copy.py)
         "model": "mistral-medium-latest",
         "messages": messages,
-        "temperature": 0.9,
+        "temperature": 0.8,
         "max_tokens": 800  # Provide enough tokens for both parts
     }
 
