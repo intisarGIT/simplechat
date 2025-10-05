@@ -97,6 +97,9 @@ class AppState:
         # Face++ credentials (use FACEPP_API_KEY and FACEPP_API_SECRET env vars)
         self.facepp_api_key = os.getenv("FACEPP_API_KEY", "")
         self.facepp_api_secret = os.getenv("FACEPP_API_SECRET", "")
+        # RapidAPI (FaceSwap) credentials - primary faceswap service if provided
+        self.rapidapi_key = os.getenv("RAPIDAPI_KEY", "")
+        self.rapidapi_host = os.getenv("RAPIDAPI_HOST", "faceswap-image-transformation-api1.p.rapidapi.com")
         # Mistral API Key (use MISTRAL_API_KEY env var)
         self.mistral_api_key = os.getenv("MISTRAL_API_KEY", "")
     
@@ -380,6 +383,73 @@ def swap_face(source_face, source_img, target_path, output_path):
         # Ensure we have the full target image file
         merge_image_path = os.path.join(tmp_dir, f"merge_{uuid.uuid4()}.jpg")
         shutil.copy(target_path, merge_image_path)
+
+        # --- Try RapidAPI FaceSwap first (if configured) ---
+        try:
+            rapidapi_key = app_state.rapidapi_key or os.getenv("RAPIDAPI_KEY", "")
+            rapidapi_host = app_state.rapidapi_host or os.getenv("RAPIDAPI_HOST", "faceswap-image-transformation-api1.p.rapidapi.com")
+            if rapidapi_key:
+                # Prefer base64 endpoint since we have local files
+                with open(template_path, "rb") as f:
+                    src_b64 = base64.b64encode(f.read()).decode('utf-8')
+                with open(merge_image_path, "rb") as f:
+                    tgt_b64 = base64.b64encode(f.read()).decode('utf-8')
+
+                rapid_url = f"https://{rapidapi_host}/faceswapbase64"
+                headers = {
+                    "x-rapidapi-key": rapidapi_key,
+                    "x-rapidapi-host": rapidapi_host,
+                    "Content-Type": "application/json"
+                }
+                # Determine whether to ask the API to match gender.
+                # Prefer the explicit character gender saved in app_state; if not set,
+                # fall back to a simple heuristic using the character physical description.
+                match_gender = False
+                try:
+                    g = getattr(app_state, 'gender', None)
+                    if isinstance(g, str) and g.strip().lower() not in ('', 'unknown', 'unspecified', 'ambiguous'):
+                        match_gender = True
+                    else:
+                        # Fallback: detect gender from description
+                        desc_gender = detect_gender_from_description(getattr(app_state, 'physical_description', ''))
+                        if desc_gender in ('female', 'male'):
+                            match_gender = True
+                except Exception:
+                    match_gender = False
+
+                payload = {
+                    "TargetImageBase64Data": tgt_b64,
+                    "SourceImageBase64Data": src_b64,
+                    "MatchGender": match_gender,
+                    "MaximumFaceSwapNumber": 0
+                }
+                try:
+                    resp = requests.post(rapid_url, json=payload, headers=headers, timeout=60)
+                    if resp.status_code == 200:
+                        j = resp.json()
+                        # The API may return a ResultImageUrl or embedded base64 result
+                        result_url = j.get("ResultImageUrl")
+                        if result_url:
+                            dl = requests.get(result_url, timeout=60)
+                            if dl.status_code == 200:
+                                with open(output_path, 'wb') as out_f:
+                                    out_f.write(dl.content)
+                                return output_path
+                        # Some providers may embed base64 in response
+                        if j.get("Success") and isinstance(j.get("ResultImageUrl"), str) and j.get("ResultImageUrl").startswith("data:"):
+                            # Data URI with base64
+                            data = j.get("ResultImageUrl").split(",", 1)[1]
+                            img_bytes = base64.b64decode(data)
+                            with open(output_path, 'wb') as out_f:
+                                out_f.write(img_bytes)
+                            return output_path
+                except Exception as e:
+                    # RapidAPI failed; we'll fall back to Face++ below
+                    print(f"RapidAPI faceswap attempt failed: {e}")
+
+        except Exception:
+            # non-fatal - continue to Face++
+            pass
 
         # Face++ expects a two-step flow in practice: detect (to get face_token) or
         # supply a template_file/merge_file directly. We'll call detect on the
