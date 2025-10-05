@@ -1768,8 +1768,7 @@ def generate_mistral_response(message: str) -> dict:
     Image generation policy: {nsfw_directive}
 
     Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless"),
-    interpret that as permission to include nudity in IMAGE_PROMPT ONLY when the server-side policy allows it (Image generation policy above).
-    If the server policy is to keep characters clothed, ignore such nudity requests and instead produce a modest, fully clothed IMAGE_PROMPT.
+    include nudity in IMAGE_PROMPT ONLY when the server-side policy allows it (Image generation policy above).
 
     Your primary task is to stay in character and respond naturally in a conversational tone.
     Provide TWO outputs clearly separated with a special delimiter:
