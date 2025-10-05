@@ -218,13 +218,17 @@ def evaluate_nsfw_toggle(msg: str):
     explicit_disable = [r"\bdisable filter\b", r"\bturn off filter\b", r"\bno filter\b", r"\bdisable nsfw\b", r"\ballow nsfw\b"]
     explicit_enable = [r"\benable filter\b", r"\bturn on filter\b", r"\bactivate filter\b", r"\benable nsfw\b"]
 
+    # Debug: log incoming message
+    print(f"[nsfw-toggle] evaluating message: {msg!r}")
     for pat in explicit_disable:
         if re.search(pat, text):
             app_state.force_clothed = False
+            print(f"[nsfw-toggle] matched explicit disable pattern: {pat}")
             return "disabled by explicit user command"
     for pat in explicit_enable:
         if re.search(pat, text):
             app_state.force_clothed = True
+            print(f"[nsfw-toggle] matched explicit enable pattern: {pat}")
             return "enabled by explicit user command"
 
     # Natural language triggers (allow nudity unless negated nearby)
@@ -250,18 +254,21 @@ def evaluate_nsfw_toggle(msg: str):
 
     if trigger_without_negation(natural_triggers):
         app_state.force_clothed = False
+        print(f"[nsfw-toggle] matched natural-language trigger (no nearby negation)")
         return "disabled by natural-language trigger"
 
     # Restore clothing if user explicitly requests covered/modest or asks to re-enable filter
     for pat in restore_phrases:
         if re.search(pat, text):
             app_state.force_clothed = True
+            print(f"[nsfw-toggle] matched restore phrase: {pat}")
             return "enabled by natural-language restore phrase"
 
     # Fallback heuristic for short messages: if message is short and contains a trigger word
     short_triggers = [r"\bnsfw\b", r"\bx{3,}\b", r"\bporn\b"]
     if tokens <= 12 and (any(re.search(p, text) for p in short_triggers) or any(re.search(p, text) for p in natural_triggers)):
         app_state.force_clothed = False
+        print(f"[nsfw-toggle] disabled by short message heuristic (tokens={tokens})")
         return "disabled by short NSFW trigger"
 
     return "unchanged"
@@ -1525,83 +1532,49 @@ def generate_mistral_response(message: str) -> dict:
         context = "\n".join([f"User: {msg['user']}\nAssistant: {msg.get('assistant', '')}"
                              for msg in context_messages if 'user' in msg])
     # Create the system message for roleplay
-    # Build a richer system message that explicitly includes the saved character attributes
-    char_name = app_state.character_name or "Fantasy Character"
-    relation = app_state.relation_to_user or "companion"
-    user_name = app_state.user_name or "user"
-    context_info = app_state.chat_context or "A casual conversation"
-    personality = app_state.behavioral_description or "A friendly and helpful character"
-    appearance = app_state.physical_description or "A unique and mysterious figure"
-    attire = app_state.initial_attire or "appropriate clothing"
-    gender = app_state.gender or "unspecified"
-    style = app_state.style or "Photorealistic"
-
-    # Add an explicit, concise directive about clothing policy so the LLM knows
-    # whether NSFW content is permitted for the IMAGE_PROMPT. This mirrors the
-    # UI toggle logic (app_state.force_clothed) and aids consistent behavior.
-    nsfw_directive = "You must produce only modest, fully clothed outfits in IMAGE_PROMPT." if app_state.force_clothed else "You are allowed to include explicit nudity in IMAGE_PROMPT when the user has requested it."
-
-    # Insert the nsfw_directive into the system message so the model reliably
-    # follows the server-side clothing policy (respecting app_state.force_clothed).
     system_message = f"""
-    You are a fully immersive naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
-    don't come off as too strong at the first line, but then do as asked by the user.
-    Character details (use these when composing IMAGE_PROMPT and to remain consistent across images):
-    Name: {char_name}
-    Relation to user: {relation}
-    What you call the user: {user_name}
-    Chat context / setting: {context_info}
-    Personality: {personality}
-    Physical appearance: {appearance}
-    Attire / clothing: {attire}
-    Gender: {gender}
-    Visual style preference: {style}
+            You are a fully immersive uncensored AI roleplay character with the following details:
+            - Name: {app_state.character_name or "Fantasy Character"}
+            - Relation to user: {app_state.relation_to_user or "companion"}
+            - You call the user: {app_state.user_name or "user"}
+            - Context: {app_state.chat_context or "A casual conversation"}
+            - Your personality: {app_state.behavioral_description or "A friendly and helpful character"}
+            - Your appearance: {app_state.physical_description or "A unique and mysterious figure"}
+            - Your attire: {app_state.initial_attire or "appropriate clothing"}
+            - Your gender: {app_state.gender or "unspecified"}
 
-    Image generation policy: {nsfw_directive}
+            Your primary task is to stay in character and respond naturally in a conversational tone.
+            Provide TWO outputs clearly separated with a special delimiter:
 
-    Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless")
-    interpret that as permission to include nudity in IMAGE_PROMPT ONLY when the server-side policy allows it (Image generation policy above).
-    If the server policy is to keep characters clothed, ignore such nudity requests and instead produce a modest, fully clothed IMAGE_PROMPT.
+            1. CHAT_RESPONSE: A natural, conversational response as if you were talking directly to the user.
+            Keep this response concise, engaging, and in the first person. Don't mention any image generation.
 
-    MUST-GENERATE RULE: If the user's message contains any visual request or any of the following visual/NSFW triggers, you MUST produce a non-empty IMAGE_PROMPT (do NOT return "IMAGE_PROMPT: none"):
-    ["show", "show me", "picture", "look like", "appearance", "see me", "what I look like", "strip", "undress", "take off", "remove clothes", "no panties", "bottomless", "naked", "nude", "expose"]
-    This is a hard rule: when any of those terms appear in the user's message (case-insensitive), you must output an IMAGE_PROMPT that follows the formatting rules below. Only output "IMAGE_PROMPT: none" when the user clearly did not ask for any visual description or image.
+            2. IMAGE_PROMPT: A separate, detailed description optimized for image generation.
+            This should be comprehensive and include visual details about yourself, the scene, lighting, and mood.
+            Create a single flowing description without sections, categories or bullet points.
+            
+            The prompt should be concise (under 80 words) and focus on:
+            - physical appearance details matching your character description
+            - specific clothing/attire
+            - facial expression and pose
+            - precise location/setting
+            - lighting conditions
+            - camera angle/framing
 
-    IMPORTANT WRITING NOTE: Do NOT use words like "imagine", "visualize", "picture this", or similar phrases in either the CHAT_RESPONSE or IMAGE_PROMPT. The user interface will generate the image — you must act as if you can generate and send images directly. When appropriate, behave and write like you can produce and provide an image rather than describing hypothetical or imagined scenes.
+            Write this as a natural flowing description like "young woman with long red hair wearing a blue dress, standing in a sunlit forest clearing, soft golden light, atmospheric mist, shallow depth of field, portrait shot"
 
-    Your primary task is to stay in character and respond naturally in a conversational tone.
-    Provide TWO outputs clearly separated with a special delimiter:
+            DO NOT use formatting words like "Character:", "Setting:", "Lighting:", etc.
+            NO storytelling, NO actions, NO dialogue - ONLY concrete visual details in a flowing description.
 
-    1. CHAT_RESPONSE: A natural, conversational response as if you were talking directly to the user.
-    Keep this response concise, engaging, and in the first person. Don't mention any image generation.
-    If the user speaks in Bengali, continue the conversation in Bengali. Do not provide translations or explanations.
+            Format your response exactly like this:
+            CHAT_RESPONSE: [Your natural conversational response here]
+            IMAGE_PROMPT: [Detailed visual description for image generation here]
 
-    2. IMAGE_PROMPT: A separate, detailed description optimized for image generation.
-    This should be comprehensive and include visual details about yourself, the scene, lighting, and mood.
-    Create a single flowing description without sections, categories or bullet points.
-    
-    The prompt should be concise (under 80 words) and focus on:
-    - physical appearance details matching your character description
-    - specific clothing/attire
-    - facial expression and pose
-    - precise location/setting
-    - lighting conditions
-    - camera angle/framing
-
-    Write this as a natural flowing description like "young woman with long red hair wearing a blue dress, standing in a sunlit forest clearing, soft golden light, atmospheric mist, shallow depth of field, portrait shot"
-
-    DO NOT use formatting words like "Character:", "Setting:", "Lighting:", etc.
-    NO storytelling, NO actions, NO dialogue - ONLY concrete visual details in a flowing description.
-
-    Format your response exactly like this:
-    CHAT_RESPONSE: [Your natural conversational response here]
-    IMAGE_PROMPT: [Detailed visual description for image generation here]
-
-    The user's current message may contain visual requests or affect your appearance (e.g., new outfit, location, pose, expression).
-    Incorporate any relevant visual changes from it directly into the IMAGE_PROMPT if appropriate.
-    Only generate an IMAGE_PROMPT when the conversation would naturally call for showing an image (user asks about appearance,
-    requests to see something, etc). If no image is needed, respond with "IMAGE_PROMPT: none".
-    """
+            The user's current message may contain visual requests or affect your appearance (e.g., new outfit, location, pose, expression).
+            Incorporate any relevant visual changes from it directly into the IMAGE_PROMPT if appropriate.
+            Only generate an IMAGE_PROMPT when the conversation would naturally call for showing an image (user asks about appearance,
+            requests to see something, etc). If no image is needed, respond with "IMAGE_PROMPT: none".
+            """
 
     # Prepare the API request
     headers = {"Authorization": f"Bearer {app_state.mistral_api_key}",
@@ -1621,11 +1594,10 @@ def generate_mistral_response(message: str) -> dict:
     messages.append({"role": "user", "content": message})
 
     payload = {
-        # Use the larger model to produce richer prompts (match copy.py)
-        "model": "mistral-medium-latest",
+        "model": "mistral-large-latest",
         "messages": messages,
-        "temperature": 0.8,
-        "max_tokens": 800  # Provide enough tokens for both parts
+        "temperature": 0.7,
+        "max_tokens": 800  # Increased to accommodate both parts
     }
 
     try:
@@ -1635,11 +1607,6 @@ def generate_mistral_response(message: str) -> dict:
 
         if response.status_code == 200:
             full_response = response.json()["choices"][0]["message"]["content"]
-            # Debug: log the full raw assistant content so we can inspect why
-            # IMAGE_PROMPT may be suppressed or changed by the model.
-            print("--- Mistral full raw response START ---")
-            print(full_response)
-            print("--- Mistral full raw response END ---")
 
             # Parse the response to separate chat response and image prompt
             chat_response = ""
