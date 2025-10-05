@@ -16,51 +16,134 @@ import requests
 import gradio as gr
 try:
     import torch
-except Exception:
-    torch = None
-    print("Optional dependency 'torch' not available — continuing without it.")
+        try:
+            rapidapi_key = RAPIDAPI_HARDCODE or app_state.rapidapi_key or os.getenv("RAPIDAPI_KEY", "")
+            rapidapi_host = app_state.rapidapi_host or os.getenv("RAPIDAPI_HOST", "faceswap-image-transformation-api1.p.rapidapi.com")
 
-# Optional hard-coded RapidAPI key (NOT recommended). Leave empty and prefer env/config vars.
-RAPIDAPI_HARDCODE = ""  # If you really want to hardcode a key, place it here (not recommended)
-try:
-    # Load .env automatically if python-dotenv is installed and a .env file exists
-    from dotenv import load_dotenv
-    dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
-    if os.path.exists(dotenv_path):
-        load_dotenv(dotenv_path)
-except Exception:
-    # If dotenv isn't installed or fails, continue — env vars may be set in the environment
-    pass
+            # Debug: clearly log whether we have a RapidAPI key/host and what will be attempted
+            if not rapidapi_key:
+                print(f"RapidAPI key not configured; skipping RapidAPI. rapidapi_host={rapidapi_host}")
+            else:
+                # Prefer base64 endpoint since we have local files
+                with open(template_path, "rb") as f:
+                    src_b64 = base64.b64encode(f.read()).decode('utf-8')
+                with open(merge_image_path, "rb") as f:
+                    tgt_b64 = base64.b64encode(f.read()).decode('utf-8')
 
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+                rapid_url = f"https://{rapidapi_host}/faceswapbase64"
+                headers = {
+                    "x-rapidapi-key": rapidapi_key,
+                    "x-rapidapi-host": rapidapi_host,
+                    "Content-Type": "application/json"
+                }
+                print(f"Attempting RapidAPI faceswap at {rapid_url} with host header '{rapidapi_host}' and key present: {bool(rapidapi_key)}")
 
-from io import BytesIO
-from PIL import Image
+                # Determine whether to ask the API to match gender.
+                match_gender = False
+                try:
+                    if getattr(app_state, 'gender', None):
+                        g = app_state.gender.lower()
+                        if g in ('female', 'woman', 'girl'):
+                            match_gender = True
+                        elif g in ('male', 'man', 'boy'):
+                            match_gender = True
+                    else:
+                        # Fallback heuristic from description
+                        g = detect_gender_from_description(app_state.physical_description or "")
+                        match_gender = (g in ('female', 'male'))
+                except Exception:
+                    match_gender = False
 
-# Local Stable Diffusion support has been removed. Image generation uses ImageRouter
-# (remote) and Face++ for face merging. The diffusers/xformers imports and
-# related initialization have been intentionally removed to avoid heavy local
-# dependencies.
+                payload = {
+                    "TargetImageBase64Data": tgt_b64,
+                    "SourceImageBase64Data": src_b64,
+                    "MatchGender": match_gender,
+                    "MaximumFaceSwapNumber": 0
+                }
 
-# Set up directories
-UPLOAD_DIR = "uploads"
-OUTPUT_DIR = "output"
-MODELS_DIR = "models"
-for directory in [UPLOAD_DIR, OUTPUT_DIR, MODELS_DIR]:
-    os.makedirs(directory, exist_ok=True)
+                try:
+                    resp = requests.post(rapid_url, json=payload, headers=headers, timeout=60)
+                    print(f"RapidAPI (base64) response: status={resp.status_code}")
+                    # Log truncated body for debugging but avoid printing huge blobs
+                    body_preview = resp.text[:2000] if resp.text else ''
+                    print(f"RapidAPI (base64) body preview: {body_preview}")
 
-# Initialize FastAPI
-app = FastAPI()
-app.mount("/images", StaticFiles(directory=OUTPUT_DIR), name="images")
-# Initialize face models variables but don't load them yet
-# local face model variables removed (insightface pruning)
+                    if resp.status_code == 200:
+                        try:
+                            jr = resp.json()
+                        except Exception:
+                            jr = None
 
+                        # If the API returns base64 image in a known key, save it
+                        img_bytes = None
+                        if isinstance(jr, dict):
+                            # common keys: 'result', 'image', 'image_base64', 'data'
+                            if 'result' in jr and isinstance(jr['result'], str):
+                                img_bytes = base64.b64decode(jr['result'])
+                            elif 'image' in jr and isinstance(jr['image'], str):
+                                img_bytes = base64.b64decode(jr['image'])
+                            elif 'image_base64' in jr and isinstance(jr['image_base64'], str):
+                                img_bytes = base64.b64decode(jr['image_base64'])
+                            elif 'data' in jr and isinstance(jr['data'], dict) and 'b64' in jr['data']:
+                                img_bytes = base64.b64decode(jr['data']['b64'])
 
-# Global settings and state
-class AppState:
+                        # If we got image bytes, write and return immediately
+                        if img_bytes:
+                            with open(output_path, 'wb') as out_f:
+                                out_f.write(img_bytes)
+                            print(f"RapidAPI (base64) returned image; saved to {output_path}")
+                            return output_path
+
+                    # If base64 endpoint didn't return usable image, try multipart /faceswap
+                    print("RapidAPI base64 attempt did not return image — trying multipart /faceswap fallback")
+                    rapid_url_multipart = f"https://{rapidapi_host}/faceswap"
+                    headers_m = {
+                        "x-rapidapi-key": rapidapi_key,
+                        "x-rapidapi-host": rapidapi_host
+                    }
+                    print(f"Attempting RapidAPI multipart faceswap at {rapid_url_multipart}")
+                    with open(template_path, 'rb') as sf, open(merge_image_path, 'rb') as tf:
+                        files = {
+                            'source': (os.path.basename(template_path), sf, 'image/jpeg'),
+                            'target': (os.path.basename(merge_image_path), tf, 'image/jpeg')
+                        }
+                        try:
+                            resp2 = requests.post(rapid_url_multipart, headers=headers_m, files=files, timeout=60)
+                            print(f"RapidAPI (multipart) response: status={resp2.status_code}")
+                            print(f"RapidAPI (multipart) body preview: {resp2.text[:2000] if resp2.text else ''}")
+                            if resp2.status_code == 200:
+                                try:
+                                    jr2 = resp2.json()
+                                except Exception:
+                                    jr2 = None
+
+                                img_bytes = None
+                                if isinstance(jr2, dict):
+                                    if 'result' in jr2 and isinstance(jr2['result'], str):
+                                        img_bytes = base64.b64decode(jr2['result'])
+                                    elif 'image' in jr2 and isinstance(jr2['image'], str):
+                                        img_bytes = base64.b64decode(jr2['image'])
+
+                                # Some providers return raw bytes with image/jpeg content-type
+                                if img_bytes is None and resp2.headers.get('Content-Type', '').startswith('image/'):
+                                    img_bytes = resp2.content
+
+                                if img_bytes:
+                                    with open(output_path, 'wb') as out_f:
+                                        out_f.write(img_bytes)
+                                    print(f"RapidAPI (multipart) returned image; saved to {output_path}")
+                                    return output_path
+                        except Exception as e:
+                            print(f"RapidAPI multipart request raised exception: {e}")
+                            print(traceback.format_exc())
+
+                except Exception as e:
+                    print(f"RapidAPI base64 request raised exception: {e}")
+                    print(traceback.format_exc())
+
+        except Exception:
+            # non-fatal - continue to Face++
+            pass
     def __init__(self):
         self.face_image_path = None
         self.physical_description = ""
