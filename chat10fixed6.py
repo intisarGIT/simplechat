@@ -1564,8 +1564,10 @@ def generate_mistral_response(message: str) -> dict:
     If the server policy is to keep characters clothed, ignore such nudity requests and instead produce a modest, fully clothed IMAGE_PROMPT.
 
     MUST-GENERATE RULE: If the user's message contains any visual request or any of the following visual/NSFW triggers, you MUST produce a non-empty IMAGE_PROMPT (do NOT return "IMAGE_PROMPT: none"):
-    ["show", "show me", "picture", "look like", "appearance", "see me", "imagine", "visualize", "what I look like", "strip", "undress", "take off", "remove clothes", "no panties", "bottomless", "naked", "nude", "expose"]
+    ["show", "show me", "picture", "look like", "appearance", "see me", "what I look like", "strip", "undress", "take off", "remove clothes", "no panties", "bottomless", "naked", "nude", "expose"]
     This is a hard rule: when any of those terms appear in the user's message (case-insensitive), you must output an IMAGE_PROMPT that follows the formatting rules below. Only output "IMAGE_PROMPT: none" when the user clearly did not ask for any visual description or image.
+
+    IMPORTANT WRITING NOTE: Do NOT use words like "imagine", "visualize", "picture this", or similar phrases in either the CHAT_RESPONSE or IMAGE_PROMPT. The user interface will generate the image — you must act as if you can generate and send images directly. When appropriate, behave and write like you can produce and provide an image rather than describing hypothetical or imagined scenes.
 
     Your primary task is to stay in character and respond naturally in a conversational tone.
     Provide TWO outputs clearly separated with a special delimiter:
@@ -1675,8 +1677,8 @@ def should_generate_image(response: str) -> bool:
     visual_triggers = [
         "show you", "imagine", "picture", "visualize", "look like",
         "appearance", "see me", "this is how", "visually", "image",
-        "here I am", "what I look like", "let me show", "here's what",
-        "I appear", "I look", "you'd see"
+        "here i am", "what i look like", "let me show", "here's what",
+        "i appear", "i look", "you'd see"
     ]
 
     response_lower = response.lower()
