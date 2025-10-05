@@ -1035,17 +1035,8 @@ def swap_face(source_face, source_img, target_path, output_path):
                 else:
                     detect_last_err = (resp.status_code, resp.text)
                     print(f"Detect(user) returned {resp.status_code}: {resp.text}")
-                    if resp.status_code == 401:
-                        raise RuntimeError(f"Face++ authentication error (detect user): {resp.status_code} {resp.text}")
+                    # Try the next regional endpoint
                     continue
-            except Exception as e:
-                detect_last_err = (None, str(e))
-                print(f"Face++ detect error (user) at {detect_url}: {e}")
-                continue
-
-        # Detect on generated target image (merge_image_path points to generated image)
-        for detect_url in detect_endpoints:
-            try:
                 print(f"Attempting Face++ detect (generated image) at {detect_url}")
                 with open(merge_image_path, 'rb') as tf:
                     files = {'image_file': tf}
@@ -1404,13 +1395,13 @@ def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
 
         # Use a short timeout and treat this as best-effort fallback
         resp = requests.post(url, json=payload, headers=headers, timeout=30)
-        if resp.status_code not in (200, 201):
+        if resp.status_code not in (200, 201, 202):
             print(f"Horde minimal fallback returned {resp.status_code}: {resp.text}")
             return None, f"Horde error {resp.status_code}: {resp.text}"
 
-        # Stable Horde async returns a job id; for minimal approach, try to read content
         data = resp.json()
-        # If result is directly available as base64, handle it; otherwise skip
+
+        # If Horde returned an inline generation immediately, save and return it
         if isinstance(data, dict) and 'generations' in data and isinstance(data['generations'], list) and len(data['generations'])>0:
             gen = data['generations'][0]
             if 'img' in gen:
@@ -1423,7 +1414,48 @@ def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
                 app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
                 return output_filename, "Image generated via Horde fallback"
 
-        # If we couldn't parse an image, return failure
+        # If Horde returned 202 with a job id, poll for result (Horde typical async flow)
+        job_id = None
+        if isinstance(data, dict) and 'id' in data:
+            job_id = data['id']
+
+        if job_id:
+            result_url = f"https://stablehorde.net/api/v2/generate/status/{job_id}"
+            # Poll with exponential backoff up to ~150 seconds total
+            wait = 1.0
+            total_wait = 0.0
+            while total_wait < 150:
+                try:
+                    time.sleep(wait)
+                    total_wait += wait
+                    wait = min(wait * 1.8, 10)
+                    r = requests.get(result_url, headers=headers, timeout=30)
+                    if r.status_code == 200:
+                        jd = r.json()
+                        if isinstance(jd, dict) and 'generations' in jd and isinstance(jd['generations'], list) and len(jd['generations'])>0:
+                            gen = jd['generations'][0]
+                            if 'img' in gen:
+                                img_b64 = gen['img']
+                                image_bytes = base64.b64decode(img_b64)
+                                output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
+                                output_path = os.path.join(OUTPUT_DIR, output_filename)
+                                with open(output_path, 'wb') as f:
+                                    f.write(image_bytes)
+                                app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
+                                return output_filename, "Image generated via Horde fallback"
+                        # if not ready, continue polling
+                    else:
+                        # Non-200 from status endpoint - continue or break based on code
+                        print(f"Horde status returned {r.status_code}: {r.text}")
+                except Exception as e:
+                    print(f"Error polling Horde status: {e}")
+                    print(traceback.format_exc())
+                    # continue polling until timeout
+                    continue
+
+        # If we couldn't get a generation result, return failure but surface job id if any
+        if job_id:
+            return None, f"Horde job {job_id} submitted but no inline image returned (poll timed out)"
         return None, "Horde did not return an inline image"
     except Exception as e:
         print(f"Exception in Horde fallback: {e}")
