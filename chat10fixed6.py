@@ -1416,7 +1416,7 @@ def generate_image_ai_horde(prompt, seed=None):
 
         data = {
             "prompt": prompt,
-            "model": "juggernaut_xl",
+            "models": ["juggernaut_xl"],  # AI Horde expects "models" array
             "params": {
                 "width": 512,
                 "height": 768,
@@ -1427,10 +1427,14 @@ def generate_image_ai_horde(prompt, seed=None):
                 "nsfw": True
             }
         }
+        
+        # Add seed if provided
+        if seed is not None:
+            data["params"]["seed"] = str(seed)
 
         print("Sending request to AI Horde...")
         resp = requests.post(API_URL, json=data, headers=headers, timeout=30)
-        if resp.status_code not in (200, 201):
+        if resp.status_code not in (200, 201, 202):
             print(f"AI Horde returned status {resp.status_code}: {resp.text}")
             return None, f"AI Horde start error {resp.status_code}: {resp.text}"
 
@@ -1452,44 +1456,52 @@ def generate_image_ai_horde(prompt, seed=None):
                 check_resp = requests.get(f"{CHECK_URL}/{job_id}", headers=headers, timeout=30)
                 if check_resp.status_code != 200:
                     print(f"AI Horde check returned {check_resp.status_code}: {check_resp.text}")
-                    time.sleep(1)
+                    time.sleep(2)
                     continue
                 chk = check_resp.json()
+                print(f"AI Horde status check {attempt}: done={chk.get('done')}, finished={chk.get('finished', 0)}, processing={chk.get('processing', 0)}, waiting={chk.get('waiting', 0)}")
+                
                 if chk.get("done"):
-                    gens = chk.get("generations") or chk.get("generation") or []
+                    gens = chk.get("generations") or []
                     if isinstance(gens, list) and len(gens) > 0:
                         first = gens[0]
                         img_b64 = first.get("img") or first.get("base64") or first.get("b64")
                         if img_b64:
                             break
-                    # Some variants may include 'imgs' list
-                    if chk.get("imgs") and isinstance(chk.get("imgs"), list) and len(chk.get("imgs"))>0:
-                        img_b64 = chk.get("imgs")[0].get("img")
-                        if img_b64:
-                            break
-                # Not done yet
-                time.sleep(1)
+                    print(f"Request done but no image found in generations: {gens}")
+                    return None, "AI Horde generation completed but no image returned"
+                
+                # Check for faulted/failed status
+                if chk.get("faulted"):
+                    return None, "AI Horde generation failed (faulted)"
+                    
+                # Not done yet, continue polling
+                time.sleep(2)
             except Exception as e:
                 print(f"AI Horde poll error: {e}")
-                time.sleep(1)
+                time.sleep(2)
 
         if not img_b64:
-            print("AI Horde did not return an image within timeout")
+            print("AI Horde did not return an image within timeout or attempts")
             return None, "AI Horde generation timed out or failed"
 
-        # img_b64 may already be raw bytes or a base64 string
+        print(f"AI Horde returned image data (length: {len(img_b64) if isinstance(img_b64, str) else 'not string'})")
+
+        # img_b64 should be a base64 string
         if isinstance(img_b64, str):
             try:
-                image_bytes = base64.b64decode(img_b64)
-            except Exception:
-                # Maybe the API returned a data URL
+                # Handle data URLs like "data:image/webp;base64,..."
                 if img_b64.startswith("data:"):
                     comma = img_b64.find(",")
-                    image_bytes = base64.b64decode(img_b64[comma+1:])
-                else:
-                    return None, "AI Horde returned invalid image data"
+                    if comma != -1:
+                        img_b64 = img_b64[comma+1:]
+                image_bytes = base64.b64decode(img_b64)
+            except Exception as e:
+                print(f"Failed to decode base64 image: {e}")
+                return None, "AI Horde returned invalid base64 image data"
         else:
-            image_bytes = img_b64
+            print("AI Horde returned non-string image data")
+            return None, "AI Horde returned unexpected image data format"
 
         # Save image
         output_filename = f"generated_aihorde_{uuid.uuid4()}.jpg"
