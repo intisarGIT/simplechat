@@ -1795,9 +1795,9 @@ def generate_mistral_response(message: str) -> dict:
     messages.append({"role": "user", "content": message})
 
     payload = {
-        "model": "mistral-large-latest",
+        "model": "mistral-medium-latest",
         "messages": messages,
-        "temperature": 0.7,
+        "temperature": 0.8,
         "max_tokens": 800  # Increased to accommodate both parts
     }
 
