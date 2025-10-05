@@ -210,52 +210,59 @@ def evaluate_nsfw_toggle(msg: str):
 
     Returns a short reason string describing what occurred.
     """
-    lower_msg = msg.lower()
-    tokens = len(msg.split())
+    # Use whole-word regex matching to avoid substring false positives.
+    text = (msg or "").lower()
+    tokens = len(text.split())
 
-    nsfw_trigger_words = [
-        "strip", "undress", "remove clothes", "take off", "bare", "naked",
-        "nude", "expose", "lingerie", "underwear", "nsfw", "xxx", "porn",
-        "disable filter", "turn off filter", "no filter"
-    ]
-    restore_clothing_words = [
-        "clothed", "dress up", "put clothes", "wear something", "get dressed",
-        "modest", "covered", "enable filter", "turn on filter", "activate filter"
-    ]
+    # Explicit command patterns — these should always take precedence
+    explicit_disable = [r"\bdisable filter\b", r"\bturn off filter\b", r"\bno filter\b", r"\bdisable nsfw\b", r"\ballow nsfw\b"]
+    explicit_enable = [r"\benable filter\b", r"\bturn on filter\b", r"\bactivate filter\b", r"\benable nsfw\b"]
 
-    # 1) Explicit commands
-    if any(kw in lower_msg for kw in ["disable filter", "turn off filter", "no filter", "disable nsfw", "allow nsfw"]):
-        app_state.force_clothed = False
-        return "disabled by explicit user command"
-    if any(kw in lower_msg for kw in ["enable filter", "turn on filter", "activate filter", "enable nsfw"]):
-        app_state.force_clothed = True
-        return "enabled by explicit user command"
+    for pat in explicit_disable:
+        if re.search(pat, text):
+            app_state.force_clothed = False
+            return "disabled by explicit user command"
+    for pat in explicit_enable:
+        if re.search(pat, text):
+            app_state.force_clothed = True
+            return "enabled by explicit user command"
 
-    # 2) Natural-language triggers (allow nudity unless negated)
-    natural_nsfw_triggers = [
-        "strip", "undress", "take off", "remove clothes", "show me naked", "show me your", "no panties",
-        "no underwear", "bottomless", "naked", "nude", "bare", "expose", "panties off", "panties removed"
-    ]
-    negation_phrases = ["do not", "don't", "do n't", "never", "no,", "not "]
+    # Natural language triggers (allow nudity unless negated nearby)
+    natural_triggers = [r"\bstrip\b", r"\bundress\b", r"\btake off\b", r"\bremove clothes\b", r"\bno panties\b",
+                        r"\bbottomless\b", r"\bnaked\b", r"\bnude\b", r"\bbare\b", r"\bexpose\b"]
+    restore_phrases = [r"\bclothed\b", r"\bdress up\b", r"\bput clothes\b", r"\bget dressed\b", r"\bmodest\b", r"\bcovered\b"]
 
-    found_trigger = any(trigger in lower_msg for trigger in natural_nsfw_triggers)
-    found_restore = any(word in lower_msg for word in restore_clothing_words)
-    has_negation = any(neg in lower_msg for neg in negation_phrases)
+    # Negation detection: look for negation words within a small window around the trigger
+    negation_words = [r"\bdo not\b", r"\bdon't\b", r"\bnever\b", r"\bnot\b", r"\bno\b"]
 
-    if found_trigger and not has_negation:
+    # Helper to detect trigger with no nearby negation (window of ~8 words)
+    def trigger_without_negation(patterns):
+        for pat in patterns:
+            for m in re.finditer(pat, text):
+                # Extract surrounding window
+                start, end = m.start(), m.end()
+                window_start = max(0, start - 80)
+                window_end = min(len(text), end + 80)
+                window = text[window_start:window_end]
+                if not any(re.search(n, window) for n in negation_words):
+                    return True
+        return False
+
+    if trigger_without_negation(natural_triggers):
         app_state.force_clothed = False
         return "disabled by natural-language trigger"
-    if found_restore:
-        app_state.force_clothed = True
-        return "enabled by natural-language restore phrase"
 
-    # 3) Fallback heuristic for short messages
-    if any(word in lower_msg for word in nsfw_trigger_words) and tokens <= 77:
+    # Restore clothing if user explicitly requests covered/modest or asks to re-enable filter
+    for pat in restore_phrases:
+        if re.search(pat, text):
+            app_state.force_clothed = True
+            return "enabled by natural-language restore phrase"
+
+    # Fallback heuristic for short messages: if message is short and contains a trigger word
+    short_triggers = [r"\bnsfw\b", r"\bx{3,}\b", r"\bporn\b"]
+    if tokens <= 12 and (any(re.search(p, text) for p in short_triggers) or any(re.search(p, text) for p in natural_triggers)):
         app_state.force_clothed = False
         return "disabled by short NSFW trigger"
-    if any(word in lower_msg for word in restore_clothing_words):
-        app_state.force_clothed = True
-        return "enabled by restore phrase"
 
     return "unchanged"
 
