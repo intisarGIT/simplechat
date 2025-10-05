@@ -1622,7 +1622,7 @@ def generate_mistral_response(message: str) -> dict:
         # Use the larger model to produce richer prompts (match copy.py)
         "model": "mistral-medium-latest",
         "messages": messages,
-        "temperature": 0.7,
+        "temperature": 0.9,
         "max_tokens": 800  # Provide enough tokens for both parts
     }
 
