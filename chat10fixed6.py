@@ -1341,11 +1341,16 @@ def generate_image(prompt, seed=None):
             print("No image found in ImageRouter response")
             return None, "No image in ImageRouter response"
 
-        # Save image to output dir
+        # Save image to output dir and normalize as JPEG to avoid format issues
         output_filename = f"generated_{uuid.uuid4()}.jpg"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
-        with open(output_path, "wb") as f:
-            f.write(image_bytes)
+        try:
+            img = Image.open(BytesIO(image_bytes)).convert("RGB")
+            img.save(output_path, format="JPEG", quality=95)
+        except Exception:
+            # fallback: write raw bytes if PIL fails for some reason
+            with open(output_path, "wb") as f:
+                f.write(image_bytes)
 
         # Cache and return
         app_state.prompt_cache[cache_key] = output_filename
@@ -1409,8 +1414,12 @@ def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
                 image_bytes = base64.b64decode(img_b64)
                 output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
                 output_path = os.path.join(OUTPUT_DIR, output_filename)
-                with open(output_path, 'wb') as f:
-                    f.write(image_bytes)
+                try:
+                    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+                    img.save(output_path, format="JPEG", quality=95)
+                except Exception:
+                    with open(output_path, 'wb') as f:
+                        f.write(image_bytes)
                 app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
                 return output_filename, "Image generated via Horde fallback"
 
@@ -1439,8 +1448,12 @@ def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
                                 image_bytes = base64.b64decode(img_b64)
                                 output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
                                 output_path = os.path.join(OUTPUT_DIR, output_filename)
-                                with open(output_path, 'wb') as f:
-                                    f.write(image_bytes)
+                                try:
+                                    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+                                    img.save(output_path, format="JPEG", quality=95)
+                                except Exception:
+                                    with open(output_path, 'wb') as f:
+                                        f.write(image_bytes)
                                 app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
                                 return output_filename, "Image generated via Horde fallback"
                         # if not ready, continue polling
