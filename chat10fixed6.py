@@ -259,6 +259,17 @@ def evaluate_nsfw_toggle(msg: str):
 
     return "unchanged"
 
+
+def message_requests_image(msg: str) -> bool:
+    """Return True if the user's message contains clear visual/image requests or NSFW triggers."""
+    m = msg.lower()
+    triggers = [
+        "show", "show me", "picture", "look like", "appearance", "see me", "imagine", "visualize",
+        "what i look like", "strip", "undress", "take off", "remove clothes", "no panties", "bottomless",
+        "naked", "nude", "expose"
+    ]
+    return any(t in m for t in triggers)
+
 # Change from a method to a standalone function that uses app_state
 def generate_character_preview():
     """Generate a face-swapped character preview image based on inputs"""  
@@ -1527,7 +1538,7 @@ def generate_mistral_response(message: str) -> dict:
     # follows the server-side clothing policy (respecting app_state.force_clothed).
     system_message = f"""
     You are a fully immersive naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
-    don't come off as too strong at the very beginning, only start being naughty gradually if initiated by the user.
+    don't come off as too strong at the very beginning, only start being naughty if initiated by the user.
     Character details (use these when composing IMAGE_PROMPT and to remain consistent across images):
     Name: {char_name}
     Relation to user: {relation}
@@ -1541,9 +1552,13 @@ def generate_mistral_response(message: str) -> dict:
 
     Image generation policy: {nsfw_directive}
 
-    Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless"),
+    Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless")
     interpret that as permission to include nudity in IMAGE_PROMPT ONLY when the server-side policy allows it (Image generation policy above).
     If the server policy is to keep characters clothed, ignore such nudity requests and instead produce a modest, fully clothed IMAGE_PROMPT.
+
+    MUST-GENERATE RULE: If the user's message contains any visual request or any of the following visual/NSFW triggers, you MUST produce a non-empty IMAGE_PROMPT (do NOT return "IMAGE_PROMPT: none"):
+    ["show", "show me", "picture", "look like", "appearance", "see me", "imagine", "visualize", "what I look like", "strip", "undress", "take off", "remove clothes", "no panties", "bottomless", "naked", "nude", "expose"]
+    This is a hard rule: when any of those terms appear in the user's message (case-insensitive), you must output an IMAGE_PROMPT that follows the formatting rules below. Only output "IMAGE_PROMPT: none" when the user clearly did not ask for any visual description or image.
 
     Your primary task is to stay in character and respond naturally in a conversational tone.
     Provide TWO outputs clearly separated with a special delimiter:
@@ -2015,8 +2030,9 @@ async def chat(chat_message: ChatMessage):
     reason = evaluate_nsfw_toggle(message)
     print(f"NSFW toggle evaluation result: {reason}")
 
-    # Generate a response
-    response_data = generate_mistral_response(message)
+    # Generate a response. If the message requests an image, add a brief hint so the LLM returns IMAGE_PROMPT.
+    msg_for_mistral = ("[GENERATE_IMAGE] " + message) if message_requests_image(message) else message
+    response_data = generate_mistral_response(msg_for_mistral)
     chat_response = response_data["chat_response"]
     image_prompt = response_data["image_prompt"]
 
