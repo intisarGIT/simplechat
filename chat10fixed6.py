@@ -399,7 +399,58 @@ def swap_face(source_face, source_img, target_path, output_path):
                 with open(merge_image_path, "rb") as f:
                     tgt_b64 = base64.b64encode(f.read()).decode('utf-8')
 
-                # Try the base64 JSON endpoint first
+                # First, try the alternate RapidAPI provider (multipart file upload) as PRIMARY
+                try:
+                    alt_host_primary = "faceswap-image-transformation-api-free-api-face-swap.p.rapidapi.com"
+                    alt_url_primary = f"https://{alt_host_primary}/api/face-swap/create"
+                    headers_alt = {
+                        "x-rapidapi-key": rapidapi_key,
+                        "x-rapidapi-host": alt_host_primary
+                    }
+                    print(f"Attempting RapidAPI (free) multipart faceswap at {alt_url_primary}")
+                    with open(template_path, 'rb') as src_f, open(merge_image_path, 'rb') as tgt_f:
+                        files_alt = {
+                            'source_image': ('source.jpg', src_f, 'image/jpeg'),
+                            'target_image': ('target.jpg', tgt_f, 'image/jpeg')
+                        }
+                        resp_alt = requests.post(alt_url_primary, headers=headers_alt, files=files_alt, timeout=120)
+
+                    print(f"RapidAPI (free) primary response status: {resp_alt.status_code}")
+                    try:
+                        j_alt = resp_alt.json()
+                    except Exception:
+                        j_alt = None
+
+                    if j_alt:
+                        print(f"RapidAPI (free) primary response keys: {list(j_alt.keys())}")
+                        code = j_alt.get('code')
+                        data_block = j_alt.get('data') or {}
+                        image_url = None
+                        if isinstance(data_block, dict):
+                            image_url = data_block.get('image_url') or data_block.get('url')
+
+                        if isinstance(image_url, str) and image_url.startswith('http'):
+                            try:
+                                dl_alt = requests.get(image_url, timeout=60)
+                                if dl_alt.status_code == 200:
+                                    with open(output_path, 'wb') as out_f:
+                                        out_f.write(dl_alt.content)
+                                    print("RapidAPI (free) primary returned image_url; downloaded and saved to output_path")
+                                    return output_path
+                                else:
+                                    print(f"Failed to download RapidAPI (free) primary image_url: {dl_alt.status_code}")
+                            except Exception as exd:
+                                print(f"Error downloading RapidAPI (free) primary image_url: {exd}")
+
+                    # If we reach here the primary attempt didn't yield an image; log resp.text for diagnosis
+                    try:
+                        print(f"RapidAPI (free) primary resp.text: {resp_alt.text}")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"RapidAPI (free) primary attempt failed: {e}")
+
+                # Try the base64 JSON endpoint next
                 rapid_url = f"https://{rapidapi_host}/faceswapbase64"
                 headers = {
                     "x-rapidapi-key": rapidapi_key,
@@ -602,6 +653,11 @@ def swap_face(source_face, source_img, target_path, output_path):
                                         print(f"Attempting RapidAPI URL-based faceswap at {rapid_url3} with target={tgt_url} source={src_url}")
                                         resp3 = requests.post(rapid_url3, json=payload3, headers=headers3, timeout=120)
                                         print(f"RapidAPI URL-based response status: {resp3.status_code}")
+                                        if resp3.status_code != 200:
+                                            try:
+                                                print(f"RapidAPI URL-based resp.text: {resp3.text}")
+                                            except Exception:
+                                                pass
                                         try:
                                             j3 = resp3.json()
                                         except Exception:
@@ -658,6 +714,11 @@ def swap_face(source_face, source_img, target_path, output_path):
                                                 print(f"Attempting RapidAPI URL-based faceswap at {rapid_url3} with target={tgt_url} source={src_url}")
                                                 resp3 = requests.post(rapid_url3, json=payload3, headers=headers3, timeout=120)
                                                 print(f"RapidAPI URL-based response status: {resp3.status_code}")
+                                                if resp3.status_code != 200:
+                                                    try:
+                                                        print(f"RapidAPI URL-based resp.text: {resp3.text}")
+                                                    except Exception:
+                                                        pass
                                                 try:
                                                     j3 = resp3.json()
                                                 except Exception:
