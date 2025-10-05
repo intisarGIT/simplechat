@@ -488,31 +488,30 @@ def swap_face(source_face, source_img, target_path, output_path):
                         "x-rapidapi-host": alt_host_primary
                     }
                     print(f"Attempting RapidAPI (free) multipart faceswap at {alt_url_primary}")
-                    # Build raw multipart body with explicit boundary to match provider expectations
-                    boundary = '---011000010111000001101001'
+
+                    # Ensure both template and merge images are valid JPEGs (normalize)
+                    try:
+                        for pth in (template_path, merge_image_path):
+                            try:
+                                im = Image.open(pth).convert("RGB")
+                                im.save(pth, format="JPEG", quality=95)
+                            except Exception:
+                                # leave original file if PIL cannot open
+                                print(f"Warning: could not normalize image {pth}")
+                    except Exception as rexc:
+                        print(f"Error normalizing images: {rexc}")
+
+                    # Use requests' files= interface for multipart upload
                     try:
                         with open(template_path, 'rb') as src_f, open(merge_image_path, 'rb') as tgt_f:
-                            src_bytes = src_f.read()
-                            tgt_bytes = tgt_f.read()
-
-                        parts = []
-                        parts.append(f"--{boundary}\r\n".encode('utf-8'))
-                        parts.append(b'Content-Disposition: form-data; name="source_image"; filename="source.jpg"\r\n')
-                        parts.append(b'Content-Type: image/jpeg\r\n\r\n')
-                        parts.append(src_bytes)
-                        parts.append(b"\r\n")
-                        parts.append(f"--{boundary}\r\n".encode('utf-8'))
-                        parts.append(b'Content-Disposition: form-data; name="target_image"; filename="target.jpg"\r\n')
-                        parts.append(b'Content-Type: image/jpeg\r\n\r\n')
-                        parts.append(tgt_bytes)
-                        parts.append(b"\r\n")
-                        parts.append(f"--{boundary}--\r\n".encode('utf-8'))
-                        body = b''.join(parts)
-
-                        headers_alt['Content-Type'] = f'multipart/form-data; boundary={boundary}'
-                        resp_alt = requests.post(alt_url_primary, headers=headers_alt, data=body, timeout=120)
+                            files = {
+                                'source_image': ('source.jpg', src_f, 'image/jpeg'),
+                                'target_image': ('target.jpg', tgt_f, 'image/jpeg')
+                            }
+                            # Do not set Content-Type header; requests will set boundary
+                            resp_alt = requests.post(alt_url_primary, headers=headers_alt, files=files, timeout=120)
                     except Exception as rexc:
-                        print(f"Error preparing or sending raw multipart to RapidAPI (free): {rexc}")
+                        print(f"Error preparing or sending multipart to RapidAPI (free): {rexc}")
                         raise
 
                     print(f"RapidAPI (free) primary response status: {resp_alt.status_code}")
