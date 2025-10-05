@@ -1405,6 +1405,7 @@ def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
             return None, f"Horde error {resp.status_code}: {resp.text}"
 
         data = resp.json()
+        print(f"Horde response (submit): {data}")
 
         # If Horde returned an inline generation immediately, save and return it
         if isinstance(data, dict) and 'generations' in data and isinstance(data['generations'], list) and len(data['generations'])>0:
@@ -1429,18 +1430,32 @@ def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
             job_id = data['id']
 
         if job_id:
+            # record job metadata for debugging
+            try:
+                if not hasattr(app_state, 'horde_jobs'):
+                    app_state.horde_jobs = {}
+                app_state.horde_jobs[job_id] = {'prompt': prompt, 'seed': seed, 'submitted_at': time.time(), 'status': 'submitted'}
+            except Exception:
+                pass
+
             result_url = f"https://stablehorde.net/api/v2/generate/status/{job_id}"
+            print(f"Polling Horde job status at {result_url}")
             # Poll with exponential backoff up to ~150 seconds total
             wait = 1.0
             total_wait = 0.0
+            attempt = 0
             while total_wait < 150:
                 try:
                     time.sleep(wait)
                     total_wait += wait
+                    attempt += 1
+                    print(f"Horde poll attempt {attempt} for job {job_id} (waited {total_wait:.1f}s)")
                     wait = min(wait * 1.8, 10)
                     r = requests.get(result_url, headers=headers, timeout=30)
+                    print(f"Horde status HTTP {r.status_code}")
                     if r.status_code == 200:
                         jd = r.json()
+                        print(f"Horde status payload: {jd}")
                         if isinstance(jd, dict) and 'generations' in jd and isinstance(jd['generations'], list) and len(jd['generations'])>0:
                             gen = jd['generations'][0]
                             if 'img' in gen:
@@ -1455,15 +1470,22 @@ def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
                                     with open(output_path, 'wb') as f:
                                         f.write(image_bytes)
                                 app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
+                                try:
+                                    app_state.horde_jobs[job_id]['status'] = 'completed'
+                                    app_state.horde_jobs[job_id]['finished_at'] = time.time()
+                                except Exception:
+                                    pass
+                                print(f"Horde job {job_id} completed and saved to {output_path}")
                                 return output_filename, "Image generated via Horde fallback"
-                        # if not ready, continue polling
+                        # not yet ready
+                        continue
                     else:
-                        # Non-200 from status endpoint - continue or break based on code
                         print(f"Horde status returned {r.status_code}: {r.text}")
+                        # continue polling for transient non-200 responses
+                        continue
                 except Exception as e:
-                    print(f"Error polling Horde status: {e}")
+                    print(f"Exception while polling Horde job {job_id}: {e}")
                     print(traceback.format_exc())
-                    # continue polling until timeout
                     continue
 
         # If we couldn't get a generation result, return failure but surface job id if any
