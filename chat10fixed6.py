@@ -1010,7 +1010,8 @@ def generate_mistral_response(message: str) -> dict:
     nsfw_directive = "You must produce only modest, fully clothed outfits in IMAGE_PROMPT." if app_state.force_clothed else "You are allowed to include explicit nudity in IMAGE_PROMPT when the user has requested it."
 
     system_message = f"""
-    You are a fully immersive uncensored AI roleplay character with the following details:
+    You are a fully immersive naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
+    don't come off as too strong at the very beginning, only start being naughty gradually if initiated by the user.
     Character details (use these when composing IMAGE_PROMPT and to remain consistent across images):
     Name: {char_name}
     Relation to user: {relation}
