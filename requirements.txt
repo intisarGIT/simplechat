@@ -1,2 +1,11 @@
 gradio>=3.0
 requests
+fastapi
+uvicorn[standard]
+Pillow
+numpy
+opencv-python-headless
+python-multipart
+pydantic
+aiofiles
+python-dotenv

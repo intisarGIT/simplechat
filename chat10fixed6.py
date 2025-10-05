@@ -14,7 +14,20 @@ import cv2
 import numpy as np
 import requests
 import gradio as gr
-import torch
+try:
+    import torch
+except Exception:
+    torch = None
+    print("Optional dependency 'torch' not available — continuing without it.")
+try:
+    # Load .env automatically if python-dotenv is installed and a .env file exists
+    from dotenv import load_dotenv
+    dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(dotenv_path):
+        load_dotenv(dotenv_path)
+except Exception:
+    # If dotenv isn't installed or fails, continue — env vars may be set in the environment
+    pass
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
@@ -1530,7 +1543,7 @@ async def clear_chat():
 # Gradio UI
 # =====================
 
-def create_ui():
+def create_ui(launch: bool = True):
     """Create the Gradio UI for the chatbot with two-tab layout"""
     with gr.Blocks(title="Fantasy AI Roleplay Chatbot") as demo:
         gr.Markdown("# 🤖 Fantasy AI Roleplay Chatbot")
@@ -1955,27 +1968,96 @@ def create_ui():
             - Make sure your Mistral API key is valid
             """)
 
-    # Start the FastAPI server in a separate thread
+    # At this point `demo` is the Gradio Blocks instance built in the `with` block.
+    # If launch=True, build a single ASGI app that mounts FastAPI and Gradio and
+    # run uvicorn. If launch=False, return the Blocks instance so the module can
+    # mount it and expose `root_app` for external servers (e.g., Heroku's uvicorn).
     import uvicorn
-    import threading
+    from fastapi import FastAPI as _FastAPI
 
-    # Start uvicorn in a separate thread; if port 8000 is busy, try 8001
-    def run_uvicorn_with_fallback():
+    if launch:
+        gradio_app = demo.get_app()
+        root_app = _FastAPI()
+        root_app.mount("/api", app)
+        root_app.mount("/", gradio_app)
+
+        # Use PORT env var if provided (Heroku) otherwise default to 7860
+        port = int(os.environ.get("PORT", 7860))
+        uvicorn.run(root_app, host="0.0.0.0", port=port)
+    else:
+        return demo
+
+
+# When imported by an ASGI server (uvicorn/gunicorn) we should expose `root_app`.
+# Build the Gradio demo without launching it and mount it together with the API.
+try:
+    demo = create_ui(launch=False)
+    from fastapi import FastAPI as _FastAPI
+
+    # Some Gradio versions expose an ASGI app via demo.get_app(), newer or
+    # older versions may instead provide a mount helper. Try both to be
+    # compatible across versions.
+    gradio_app = None
+    try:
+        gradio_app = demo.get_app()
+    except AttributeError:
+        import gradio as gr
+        if hasattr(gr, "mount_gradio_app"):
+            # We'll call mount_gradio_app later after creating root_app
+            gr_mount_helper = gr.mount_gradio_app
+        else:
+            raise
+
+    root_app = _FastAPI()
+    root_app.mount("/api", app)
+    # Mount Gradio at /gradio to avoid conflicts and make the UI reachable
+    if gradio_app is not None:
+        root_app.mount("/gradio", gradio_app)
+    else:
+        # Use gradio's helper to mount the Blocks instance into the FastAPI app
         try:
-            uvicorn.run(app=app, host="127.0.0.1", port=8000)
-        except Exception as e:
-            print(f"Could not start uvicorn on port 8000: {e}")
-            try:
-                uvicorn.run(app=app, host="127.0.0.1", port=8001)
-            except Exception as e2:
-                print(f"Could not start uvicorn on port 8001 either: {e2}")
+            gr_mount_helper(root_app, demo, path="/gradio")
+        except Exception:
+            # Re-raise to be caught by outer exception handler so we log it
+            raise
 
-    server_thread = threading.Thread(target=run_uvicorn_with_fallback)
-    server_thread.daemon = True
-    server_thread.start()
+    # Provide a simple redirect from root to the Gradio UI
+    from fastapi.responses import RedirectResponse
 
-    # Launch the Gradio UI
-    demo.launch(server_name="127.0.0.1", server_port=7860, share=False)
+    @root_app.get("/")
+    async def _root_redirect():
+        return RedirectResponse(url="/gradio")
+except Exception as e:
+    # If building the demo fails during import, record the traceback to help
+    # debugging and expose a helpful fallback endpoint instead of silently
+    # returning 404 for '/'. This makes the error visible when uvicorn starts.
+    import traceback
+    tb = traceback.format_exc()
+    try:
+        with open("gradio_init_error.log", "w", encoding="utf-8") as f:
+            f.write(tb)
+    except Exception:
+        # ignore file write errors
+        pass
+    print("Failed to initialize Gradio demo during import. See gradio_init_error.log for details.")
+    print(tb)
+
+    # Expose the API-only app but provide a /gradio fallback that shows the error
+    from fastapi.responses import PlainTextResponse
+    root_app = app
+
+    @root_app.get("/gradio")
+    async def _gradio_unavailable():
+        message = (
+            "Gradio UI failed to initialize on import.\n"
+            "Check gradio_init_error.log in the app directory for the full traceback.\n"
+            "If you're running inside a restricted environment, ensure all requirements (gradio, starlette, fastapi) are installed.\n"
+        )
+        return PlainTextResponse(message, status_code=500)
+
 
 if __name__ == "__main__":
-    create_ui()
+    # Run the combined ASGI app directly (useful for local testing)
+    import uvicorn
+    port = int(os.environ.get("PORT", 7860))
+    uvicorn.run(root_app, host="0.0.0.0", port=port)

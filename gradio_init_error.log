@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "C:\image analysis\Assignment\simplechat\chat10fixed6.py", line 1983, in <module>
+    gradio_app = demo.get_app()
+AttributeError: 'Blocks' object has no attribute 'get_app'
