@@ -19,6 +19,9 @@ try:
 except Exception:
     torch = None
     print("Optional dependency 'torch' not available — continuing without it.")
+
+# Optional hard-coded RapidAPI key (NOT recommended). Leave empty and prefer env/config vars.
+RAPIDAPI_HARDCODE = ""  # If you really want to hardcode a key, place it here (not recommended)
 try:
     # Load .env automatically if python-dotenv is installed and a .env file exists
     from dotenv import load_dotenv
@@ -386,7 +389,7 @@ def swap_face(source_face, source_img, target_path, output_path):
 
         # --- Try RapidAPI FaceSwap first (if configured) ---
         try:
-            rapidapi_key = app_state.rapidapi_key or os.getenv("RAPIDAPI_KEY", "")
+            rapidapi_key = RAPIDAPI_HARDCODE or app_state.rapidapi_key or os.getenv("RAPIDAPI_KEY", "")
             rapidapi_host = app_state.rapidapi_host or os.getenv("RAPIDAPI_HOST", "faceswap-image-transformation-api1.p.rapidapi.com")
             if rapidapi_key:
                 # Prefer base64 endpoint since we have local files
@@ -1177,6 +1180,8 @@ class ApiSettings(BaseModel):
     imagerouter_api_key: Optional[str] = ""
     facepp_api_key: Optional[str] = ""
     facepp_api_secret: Optional[str] = ""
+    rapidapi_key: Optional[str] = ""
+    rapidapi_host: Optional[str] = ""
     sd_model_path: Optional[str] = ""
     scheduler_type: Optional[str] = "dpm_2m_karras"
     guidance_scale: Optional[float] = 7.0
@@ -1196,6 +1201,11 @@ async def set_api_settings(settings: ApiSettings):
         app_state.facepp_api_key = settings.facepp_api_key
     if getattr(settings, 'facepp_api_secret', None):
         app_state.facepp_api_secret = settings.facepp_api_secret
+    # Store RapidAPI key/host if provided (allows runtime update without dyno restart)
+    if getattr(settings, 'rapidapi_key', None):
+        app_state.rapidapi_key = settings.rapidapi_key
+    if getattr(settings, 'rapidapi_host', None):
+        app_state.rapidapi_host = settings.rapidapi_host
     
     # Save generation settings
     app_state.scheduler_type = settings.scheduler_type
