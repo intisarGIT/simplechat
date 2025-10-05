@@ -1524,12 +1524,13 @@ def generate_image_with_face_swap(response_text, seed=None):
             print("=============================")
             return None, "Image prompt was 'none' — skipping image generation"
 
-        # Ensure we have an uploaded character image to use as the Face++ template
+        # If no character face was uploaded, we will still generate a base image
+        # from the prompt and skip the face-swap step. This ensures images are
+        # produced even if the user hasn't uploaded a face yet.
+        do_face_swap = True
         if not app_state.face_image_path and not app_state.source_img:
-            print("\n==== FACE SWAP ERROR =====")
-            print("ERROR: No character face uploaded")
-            print("==========================")
-            return None, "No character face has been uploaded for face swapping"
+            print("No uploaded character face found — will generate base image without face swap")
+            do_face_swap = False
             
         # For the first image in chat, use the saved character seed if available and no specific seed was provided
         if seed is None and len(app_state.chat_history) <= 1 and app_state.character_seed is not None:
@@ -1586,27 +1587,39 @@ def generate_image_with_face_swap(response_text, seed=None):
         print(f"TARGET IMAGE: {generated_path}")
         print(f"OUTPUT PATH: {swapped_path}")
         
-        # Perform face swapping
-        result_path = swap_face(app_state.source_face, app_state.source_img, generated_path, swapped_path)
+        result_path = None
+        if do_face_swap:
+            # Perform face swapping
+            result_path = swap_face(app_state.source_face, app_state.source_img, generated_path, swapped_path)
 
-        if not result_path:
-            print("FACE SWAP RESULT: Failed")
-            print("FALLBACK: Using original image")
+            if not result_path:
+                print("FACE SWAP RESULT: Failed")
+                print("FALLBACK: Using original image")
+                print("==============================")
+                # Return the base generated image if swapping fails
+                app_state.last_used_prompt = response_text
+                return image_filename, "Face swap failed, using original image"
+
+            print(f"FACE SWAP RESULT: Success")
+            print(f"RESULT PATH: {result_path}")
             print("==============================")
-            return image_filename, "Face swap failed, using original image"
-        
-        print(f"FACE SWAP RESULT: Success")
-        print(f"RESULT PATH: {result_path}")
-        print("==============================")
 
-        # Store the last used prompt
-        app_state.last_used_prompt = response_text
-        print("\n==== FACE SWAP COMPLETE =====")
-        print(f"FINAL IMAGE: {os.path.basename(result_path)}")
-        print(f"PROMPT SAVED FOR REGENERATION: {response_text[:50]}{'...' if len(response_text) > 50 else ''}")
-        print("=============================")
+            # Store the last used prompt
+            app_state.last_used_prompt = response_text
+            print("\n==== FACE SWAP COMPLETE =====")
+            print(f"FINAL IMAGE: {os.path.basename(result_path)}")
+            print(f"PROMPT SAVED FOR REGENERATION: {response_text[:50]}{'...' if len(response_text) > 50 else ''}")
+            print("=============================")
 
-        return os.path.basename(result_path), "Image generated and face-swapped successfully"
+            return os.path.basename(result_path), "Image generated and face-swapped successfully"
+        else:
+            # No face uploaded - use the generated base image
+            print("Skipping face swap; returning base generated image")
+            app_state.last_used_prompt = response_text
+            print("==== FACE SWAP COMPLETE (SKIPPED) =====")
+            print(f"FINAL IMAGE: {image_filename}")
+            print("========================================")
+            return image_filename, "Generated base image (no face uploaded)"
     except Exception as e:
         # ===== DETAILED LOGGING: Face Swap Error =====
         print("\n==== FACE SWAP ERROR =====")
@@ -1774,6 +1787,16 @@ def generate_mistral_response(message: str) -> dict:
 
     messages.append({"role": "user", "content": message})
 
+    # Provide the character attributes explicitly as a user-level hint so the model
+    # reliably includes them in the IMAGE_PROMPT. This helps when the model ignores
+    # long system messages or when the user message doesn't reference appearance.
+    char_attrs = (
+        f"Character Attributes - Name: {char_name}; Physical appearance: {appearance}; "
+        f"Attire: {attire}; Personality: {personality}; Gender: {gender}; Visual style: {style}. "
+        "When producing IMAGE_PROMPT, you MUST reflect these attributes in the visual description."
+    )
+    messages.append({"role": "user", "content": char_attrs})
+
     payload = {
         # Use the larger model to produce richer prompts (match copy.py)
         "model": "mistral-medium-latest",
@@ -1799,23 +1822,42 @@ def generate_mistral_response(message: str) -> dict:
             chat_response = ""
             image_prompt = "none"
 
-            # Extract chat response
-            chat_match = re.search(r"CHAT_RESPONSE:\s*(.*?)(?=IMAGE_PROMPT:|$)", full_response, re.DOTALL)
+            # Extract chat response (case-insensitive) and image prompt
+            chat_match = re.search(r"chat_response:\s*(.*?)(?=image_prompt:|$)", full_response, re.IGNORECASE | re.DOTALL)
             if chat_match:
                 chat_response = chat_match.group(1).strip()
 
-            # Extract image prompt
-            prompt_match = re.search(r"IMAGE_PROMPT:\s*(.*?)$", full_response, re.DOTALL)
+            prompt_match = re.search(r"image_prompt:\s*(.*?)$", full_response, re.IGNORECASE | re.DOTALL)
             if prompt_match:
                 image_prompt = prompt_match.group(1).strip()
 
-            # If no proper formatting was used, use the full response as chat_response
+            # If the assistant didn't follow the exact format, fall back heuristics
             if not chat_response:
-                chat_response = full_response
+                # Try to find a natural-language assistant reply before any 'IMAGE_PROMPT' marker
+                parts = re.split(r"image_prompt:\s*", full_response, flags=re.IGNORECASE)
+                if len(parts) > 1:
+                    # Take everything before the image_prompt marker as chat response
+                    chat_response = parts[0].strip()
+                    image_prompt = parts[1].strip()
+                else:
+                    # No marker at all — treat full response as chat_response
+                    chat_response = full_response.strip()
+
+            # If no image_prompt was explicitly returned, attempt to auto-detect a visual description
+            if (not prompt_match) or (not image_prompt) or image_prompt.lower() == "none":
+                # Use a simple heuristic: take the shortest last sentence that looks like a visual description
+                candidates = [s.strip() for s in re.split(r"\n|\.|;", full_response) if len(s.strip())>10]
+                if candidates:
+                    # Prefer candidates that contain visual trigger words
+                    vis_cands = [c for c in candidates if any(w in c.lower() for w in ["wearing","standing","standing in","portrait","lighting","light","pose","wear","dress","hair","eyes","skin","background","scene"]) ]
+                    pick = vis_cands[-1] if vis_cands else candidates[-1]
+                    # If pick looks like a full sentence longer than 8 chars, use it as image prompt
+                    if len(pick) < 200 and len(pick) > 15:
+                        image_prompt = pick
 
             return {
                 "chat_response": chat_response,
-                "image_prompt": "none" if image_prompt.lower() == "none" else image_prompt
+                "image_prompt": "none" if (not image_prompt or image_prompt.lower().strip() == "none") else image_prompt
             }
         else:
             error_msg = f"Sorry, I encountered an error: {response.status_code}. Please check your API key."
