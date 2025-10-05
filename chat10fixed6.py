@@ -463,33 +463,9 @@ def swap_face(source_face, source_img, target_path, output_path):
                 except Exception as e:
                     raise RuntimeError(f"Failed to prepare template face for Face++: {e}")
 
-        # Normalize the template image to an explicit RGB JPEG copy to avoid
-        # unsupported-format errors from Face++ or RapidAPI. We save a separate
-        # normalized file in the tmp_dir so we don't overwrite the user's upload.
-        try:
-            normalized_template = os.path.join(tmp_dir, f"template_norm_{uuid.uuid4()}.jpg")
-            with Image.open(template_path) as _im:
-                im = _im.convert("RGB")
-                im.save(normalized_template, format="JPEG", quality=95)
-            template_path = normalized_template
-        except Exception as e:
-            # If normalization fails, keep the original template_path and continue;
-            # Face++ will likely fail but we surface a clearer warning in logs.
-            print(f"Warning: failed to normalize template image {template_path}: {e}")
-
         # Ensure we have the full target image file
         merge_image_path = os.path.join(tmp_dir, f"merge_{uuid.uuid4()}.jpg")
         shutil.copy(target_path, merge_image_path)
-
-        # Normalize the merged/generated image to RGB JPEG as well
-        try:
-            normalized_merge = os.path.join(tmp_dir, f"merge_norm_{uuid.uuid4()}.jpg")
-            with Image.open(merge_image_path) as _im2:
-                im2 = _im2.convert("RGB")
-                im2.save(normalized_merge, format="JPEG", quality=95)
-            merge_image_path = normalized_merge
-        except Exception as e:
-            print(f"Warning: failed to normalize merge image {merge_image_path}: {e}")
 
         # --- Try RapidAPI FaceSwap first (if configured) ---
         try:
@@ -512,30 +488,31 @@ def swap_face(source_face, source_img, target_path, output_path):
                         "x-rapidapi-host": alt_host_primary
                     }
                     print(f"Attempting RapidAPI (free) multipart faceswap at {alt_url_primary}")
-
-                    # Ensure both template and merge images are valid JPEGs (normalize)
-                    try:
-                        for pth in (template_path, merge_image_path):
-                            try:
-                                im = Image.open(pth).convert("RGB")
-                                im.save(pth, format="JPEG", quality=95)
-                            except Exception:
-                                # leave original file if PIL cannot open
-                                print(f"Warning: could not normalize image {pth}")
-                    except Exception as rexc:
-                        print(f"Error normalizing images: {rexc}")
-
-                    # Use requests' files= interface for multipart upload
+                    # Build raw multipart body with explicit boundary to match provider expectations
+                    boundary = '---011000010111000001101001'
                     try:
                         with open(template_path, 'rb') as src_f, open(merge_image_path, 'rb') as tgt_f:
-                            files = {
-                                'source_image': ('source.jpg', src_f, 'image/jpeg'),
-                                'target_image': ('target.jpg', tgt_f, 'image/jpeg')
-                            }
-                            # Do not set Content-Type header; requests will set boundary
-                            resp_alt = requests.post(alt_url_primary, headers=headers_alt, files=files, timeout=120)
+                            src_bytes = src_f.read()
+                            tgt_bytes = tgt_f.read()
+
+                        parts = []
+                        parts.append(f"--{boundary}\r\n".encode('utf-8'))
+                        parts.append(b'Content-Disposition: form-data; name="source_image"; filename="source.jpg"\r\n')
+                        parts.append(b'Content-Type: image/jpeg\r\n\r\n')
+                        parts.append(src_bytes)
+                        parts.append(b"\r\n")
+                        parts.append(f"--{boundary}\r\n".encode('utf-8'))
+                        parts.append(b'Content-Disposition: form-data; name="target_image"; filename="target.jpg"\r\n')
+                        parts.append(b'Content-Type: image/jpeg\r\n\r\n')
+                        parts.append(tgt_bytes)
+                        parts.append(b"\r\n")
+                        parts.append(f"--{boundary}--\r\n".encode('utf-8'))
+                        body = b''.join(parts)
+
+                        headers_alt['Content-Type'] = f'multipart/form-data; boundary={boundary}'
+                        resp_alt = requests.post(alt_url_primary, headers=headers_alt, data=body, timeout=120)
                     except Exception as rexc:
-                        print(f"Error preparing or sending multipart to RapidAPI (free): {rexc}")
+                        print(f"Error preparing or sending raw multipart to RapidAPI (free): {rexc}")
                         raise
 
                     print(f"RapidAPI (free) primary response status: {resp_alt.status_code}")
@@ -1058,8 +1035,17 @@ def swap_face(source_face, source_img, target_path, output_path):
                 else:
                     detect_last_err = (resp.status_code, resp.text)
                     print(f"Detect(user) returned {resp.status_code}: {resp.text}")
-                    # Try the next regional endpoint
+                    if resp.status_code == 401:
+                        raise RuntimeError(f"Face++ authentication error (detect user): {resp.status_code} {resp.text}")
                     continue
+            except Exception as e:
+                detect_last_err = (None, str(e))
+                print(f"Face++ detect error (user) at {detect_url}: {e}")
+                continue
+
+        # Detect on generated target image (merge_image_path points to generated image)
+        for detect_url in detect_endpoints:
+            try:
                 print(f"Attempting Face++ detect (generated image) at {detect_url}")
                 with open(merge_image_path, 'rb') as tf:
                     files = {'image_file': tf}
@@ -1332,16 +1318,34 @@ def generate_image(prompt, seed=None):
 
         print("Sending request to ImageRouter...")
         resp = requests.post(url, json=payload, headers=headers, timeout=60)
+        # If ImageRouter fails (rate limit 429 or other errors), fall back to AI Horde
         if resp.status_code != 200:
             print(f"ImageRouter returned status {resp.status_code}: {resp.text}")
-            # If ImageRouter rate-limited (429) attempt a minimal Stable Horde fallback
+            # Try to detect rate limit / daily limit message
+            text_lower = resp.text.lower() if resp.text else ""
+            try:
+                j = resp.json()
+            except Exception:
+                j = {}
+
+            is_rate_limit = False
+            # Common ImageRouter/Stripe/OpenAI style rate limit messages
             if resp.status_code == 429:
-                try:
-                    horde_path, horde_msg = call_ai_horde_minimal(filtered_prompt, seed)
-                    if horde_path:
-                        return horde_path, horde_msg
-                except Exception as e:
-                    print(f"Horde fallback failed: {e}")
+                is_rate_limit = True
+            if isinstance(j, dict) and j.get("error"):
+                # e.g. {"error": {"message": "Daily limit of 50 free requests reached...", "type": "rate_limit_error"}}
+                err = j.get("error")
+                if isinstance(err, dict) and ("rate_limit" in str(err.get("type", "")).lower() or "daily limit" in str(err.get("message", "")).lower()):
+                    is_rate_limit = True
+
+            if is_rate_limit:
+                print("Detected ImageRouter rate limit — attempting AI Horde fallback")
+                aihorde_filename, aihorde_msg = generate_image_ai_horde(filtered_prompt, seed=seed)
+                if aihorde_filename:
+                    return aihorde_filename, f"AI Horde fallback: {aihorde_msg}"
+                else:
+                    return None, f"ImageRouter error {resp.status_code}: {resp.text} — AI Horde fallback failed: {aihorde_msg}"
+
             return None, f"ImageRouter error {resp.status_code}: {resp.text}"
 
         data = resp.json()
@@ -1364,16 +1368,11 @@ def generate_image(prompt, seed=None):
             print("No image found in ImageRouter response")
             return None, "No image in ImageRouter response"
 
-        # Save image to output dir and normalize as JPEG to avoid format issues
+        # Save image to output dir
         output_filename = f"generated_{uuid.uuid4()}.jpg"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
-        try:
-            img = Image.open(BytesIO(image_bytes)).convert("RGB")
-            img.save(output_path, format="JPEG", quality=95)
-        except Exception:
-            # fallback: write raw bytes if PIL fails for some reason
-            with open(output_path, "wb") as f:
-                f.write(image_bytes)
+        with open(output_path, "wb") as f:
+            f.write(image_bytes)
 
         # Cache and return
         app_state.prompt_cache[cache_key] = output_filename
@@ -1387,27 +1386,35 @@ def generate_image(prompt, seed=None):
         import traceback
         print(f"TRACEBACK: {traceback.format_exc()}")
         print("==================================")
-        return None, f"Error generating image: {str(e)}"
+        # Attempt AI Horde fallback on unexpected exceptions as well
+        try:
+            print("Attempting AI Horde fallback after exception")
+            aihorde_filename, aihorde_msg = generate_image_ai_horde(filtered_prompt, seed=seed)
+            if aihorde_filename:
+                return aihorde_filename, f"AI Horde fallback after exception: {aihorde_msg}"
+            else:
+                return None, f"Error generating image: {str(e)}; AI Horde fallback failed: {aihorde_msg}"
+        except Exception as e2:
+            print(f"AI Horde fallback also failed: {e2}")
+            return None, f"Error generating image: {str(e)}"
 
 
-def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
-    """Minimal Stable Horde fallback used ONLY on ImageRouter 429.
+def generate_image_ai_horde(prompt, seed=None):
+    """Generate an image using AI Horde (Stable Horde) async API as a fallback.
 
-    This function is intentionally small: it uses the HORDE_API_KEY env var
-    (or app_state.horde_api_key if present) and calls the Stable Horde sync
-    generation endpoint with conservative parameters. Returns (filename, msg)
-    on success or (None, msg) on failure.
+    Returns (filename, message) on success or (None, error_message) on failure.
     """
     try:
-        horde_key = os.getenv("HORDE_API_KEY", "") or getattr(app_state, 'horde_api_key', '')
-        if not horde_key:
-            print("Horde fallback skipped: HORDE_API_KEY not configured")
-            return None, "Horde API key not configured"
+        print("\n==== AI HORDE FALLBACK STARTED =====")
+        print(f"PROMPT: {prompt}")
+        print(f"SEED: {seed if seed is not None else 'None'}")
+        API_URL = "https://aihorde.net/api/v2/generate/async"
+        CHECK_URL = "https://aihorde.net/api/v2/generate/check"
 
-        # Use aihorde-like async endpoints (simpler polling model)
-        url = "https://aihorde.net/api/v2/generate/async"
-        check_base = "https://aihorde.net/api/v2/generate/check"
-        payload = {
+        api_key = os.getenv("AIHORDE_API_KEY", "")
+        headers = {"apikey": api_key} if api_key else {}
+
+        data = {
             "prompt": prompt,
             "model": "juggernaut_xl",
             "params": {
@@ -1420,148 +1427,87 @@ def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
                 "nsfw": True
             }
         }
-        if seed is not None:
-            payload['seed'] = int(seed)
-        headers = {"Content-Type": "application/json", "apikey": horde_key}
 
-        # Submit job to aihorde-like async endpoint
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
-        if resp.status_code not in (200, 201, 202):
-            print(f"Horde minimal fallback returned {resp.status_code}: {resp.text}")
-            return None, f"Horde error {resp.status_code}: {resp.text}"
+        print("Sending request to AI Horde...")
+        resp = requests.post(API_URL, json=data, headers=headers, timeout=30)
+        if resp.status_code not in (200, 201):
+            print(f"AI Horde returned status {resp.status_code}: {resp.text}")
+            return None, f"AI Horde start error {resp.status_code}: {resp.text}"
 
         job = resp.json()
-        print(f"Horde submit response: {job}")
-        job_id = job.get('id') or job.get('jobId')
+        job_id = job.get("id") or job.get("job")
         if not job_id:
-            # Some responses may include immediate generations
-            if isinstance(job, dict) and 'generations' in job and isinstance(job['generations'], list) and len(job['generations'])>0:
-                gen = job['generations'][0]
-                if 'img' in gen:
-                    img_b64 = gen['img']
-                    image_bytes = base64.b64decode(img_b64)
-                    output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
-                    output_path = os.path.join(OUTPUT_DIR, output_filename)
-                    try:
-                        img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                        img.save(output_path, format="JPEG", quality=95)
-                    except Exception:
-                        with open(output_path, 'wb') as f:
-                            f.write(image_bytes)
-                    app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
-                    return output_filename, "Image generated via Horde fallback"
-            return None, "Horde did not return job id or inline image"
+            print(f"AI Horde did not return job id: {job}")
+            return None, "AI Horde did not return job id"
 
-        # Poll the check endpoint until done
-        check_url = f"{check_base}/{job_id}"
-        total_wait = 0
-        wait = 1
-        while total_wait < 150:
+        print(f"AI Horde job started: {job_id}, polling for result...")
+
+        # Poll for completion
+        max_attempts = 120
+        attempt = 0
+        img_b64 = None
+        while attempt < max_attempts:
+            attempt += 1
             try:
-                r = requests.get(check_url, headers=headers, timeout=30)
-                if r.status_code == 200:
-                    jd = r.json()
-                    print(f"Horde check {job_id}: {jd}")
-                    # some aihorde implementations use 'done' boolean
-                    if jd.get('done'):
-                        gens = jd.get('generations') or jd.get('images') or []
-                        if gens and isinstance(gens, list) and len(gens) > 0:
-                            gen = gens[0]
-                            img_b64 = gen.get('img') or gen.get('b64') or gen.get('image') or gen.get('base64')
-                            if img_b64:
-                                image_bytes = base64.b64decode(img_b64)
-                                output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
-                                output_path = os.path.join(OUTPUT_DIR, output_filename)
-                                try:
-                                    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                                    img.save(output_path, format="JPEG", quality=95)
-                                except Exception:
-                                    with open(output_path, 'wb') as f:
-                                        f.write(image_bytes)
-                                app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
-                                return output_filename, "Image generated via Horde fallback"
-                        # If done but no generations present, try alternative result endpoints
-                        print(f"Horde job {job_id} marked done but no generations found; trying alternative result endpoints")
-                        alt_paths = [
-                            f"https://aihorde.net/api/v2/generate/result/{job_id}",
-                            f"https://aihorde.net/api/v2/generate/status/{job_id}",
-                            f"https://stablehorde.net/api/v2/generate/status/{job_id}",
-                            f"https://stablehorde.net/api/v2/generate/result/{job_id}",
-                            f"https://aihorde.net/api/v2/generate/{job_id}",
-                            f"https://stablehorde.net/api/v2/generate/{job_id}"
-                        ]
-
-                        def find_base64_in_obj(obj):
-                            # Recursively search for long base64-like strings in JSON
-                            if isinstance(obj, str):
-                                s = obj.strip()
-                                # common img prefixes for JPEG/PNG
-                                if s.startswith('/9j/') or s.startswith('iVBOR') or (len(s) > 100 and all(c.isalnum() or c in '+/=' for c in s.replace('\n','').replace('\r',''))):
-                                    return s
-                                return None
-                            if isinstance(obj, dict):
-                                for k, v in obj.items():
-                                    if isinstance(k, str) and k.lower() in ('img','image','b64','base64','result'):
-                                        if isinstance(v, str) and len(v) > 50:
-                                            return v
-                                    res = find_base64_in_obj(v)
-                                    if res:
-                                        return res
-                            if isinstance(obj, list):
-                                for item in obj:
-                                    res = find_base64_in_obj(item)
-                                    if res:
-                                        return res
-                            return None
-
-                        for alt in alt_paths:
-                            try:
-                                print(f"Trying alternative Horde result endpoint: {alt}")
-                                rr = requests.get(alt, headers=headers, timeout=30)
-                                print(f"Alt endpoint {alt} returned {rr.status_code}")
-                                if rr.status_code == 200:
-                                    try:
-                                        payload = rr.json()
-                                    except Exception:
-                                        payload = None
-                                    if payload:
-                                        b64 = find_base64_in_obj(payload)
-                                        if b64:
-                                            try:
-                                                image_bytes = base64.b64decode(b64)
-                                                output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
-                                                output_path = os.path.join(OUTPUT_DIR, output_filename)
-                                                try:
-                                                    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                                                    img.save(output_path, format="JPEG", quality=95)
-                                                except Exception:
-                                                    with open(output_path, 'wb') as f:
-                                                        f.write(image_bytes)
-                                                app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
-                                                print(f"Saved Horde image from alt endpoint {alt} to {output_path}")
-                                                return output_filename, "Image generated via Horde fallback (alt endpoint)"
-                                            except Exception as e:
-                                                print(f"Failed to decode/save image from alt endpoint {alt}: {e}")
-                            except Exception as e:
-                                print(f"Error fetching alt endpoint {alt}: {e}")
-                        # nothing found in alt endpoints; continue polling
-                        continue
-                else:
-                    print(f"Horde check {job_id} returned {r.status_code}: {r.text}")
+                check_resp = requests.get(f"{CHECK_URL}/{job_id}", headers=headers, timeout=30)
+                if check_resp.status_code != 200:
+                    print(f"AI Horde check returned {check_resp.status_code}: {check_resp.text}")
+                    time.sleep(1)
+                    continue
+                chk = check_resp.json()
+                if chk.get("done"):
+                    gens = chk.get("generations") or chk.get("generation") or []
+                    if isinstance(gens, list) and len(gens) > 0:
+                        first = gens[0]
+                        img_b64 = first.get("img") or first.get("base64") or first.get("b64")
+                        if img_b64:
+                            break
+                    # Some variants may include 'imgs' list
+                    if chk.get("imgs") and isinstance(chk.get("imgs"), list) and len(chk.get("imgs"))>0:
+                        img_b64 = chk.get("imgs")[0].get("img")
+                        if img_b64:
+                            break
+                # Not done yet
+                time.sleep(1)
             except Exception as e:
-                print(f"Error checking Horde job {job_id}: {e}")
-            time.sleep(wait)
-            total_wait += wait
-            wait = min(wait * 1.5, 10)
+                print(f"AI Horde poll error: {e}")
+                time.sleep(1)
 
-        return None, f"Horde job {job_id} timed out"
+        if not img_b64:
+            print("AI Horde did not return an image within timeout")
+            return None, "AI Horde generation timed out or failed"
+
+        # img_b64 may already be raw bytes or a base64 string
+        if isinstance(img_b64, str):
+            try:
+                image_bytes = base64.b64decode(img_b64)
+            except Exception:
+                # Maybe the API returned a data URL
+                if img_b64.startswith("data:"):
+                    comma = img_b64.find(",")
+                    image_bytes = base64.b64decode(img_b64[comma+1:])
+                else:
+                    return None, "AI Horde returned invalid image data"
+        else:
+            image_bytes = img_b64
+
+        # Save image
+        output_filename = f"generated_aihorde_{uuid.uuid4()}.jpg"
+        output_path = os.path.join(OUTPUT_DIR, output_filename)
+        with open(output_path, "wb") as f:
+            f.write(image_bytes)
+
+        # Cache and set last prompt
+        cache_key = f"{prompt}_{seed}" if seed is not None else prompt
+        app_state.prompt_cache[cache_key] = output_filename
+        app_state.last_used_prompt = prompt
+        print(f"AI Horde saved image to {output_path}")
+        return output_filename, "AI Horde image generated successfully"
     except Exception as e:
-        print(f"Exception in Horde fallback: {e}")
+        print(f"AI Horde fallback error: {e}")
+        import traceback
         print(traceback.format_exc())
-        return None, f"Horde fallback error: {str(e)}"
-
-
-
+        return None, f"AI Horde error: {str(e)}"
 
 
 def generate_image_with_face_swap(response_text, seed=None):
@@ -1733,22 +1679,55 @@ def generate_mistral_response(message: str) -> dict:
         context = "\n".join([f"User: {msg['user']}\nAssistant: {msg.get('assistant', '')}"
                              for msg in context_messages if 'user' in msg])
     # Create the system message for roleplay
+    # Build a richer system message that explicitly includes the saved character attributes
+    char_name = app_state.character_name or "Fantasy Character"
+    relation = app_state.relation_to_user or "companion"
+    user_name = app_state.user_name or "user"
+    context_info = app_state.chat_context or "A casual conversation"
+    personality = app_state.behavioral_description or "A friendly and helpful character"
+    appearance = app_state.physical_description or "A unique and mysterious figure"
+    attire = app_state.initial_attire or "appropriate clothing"
+    gender = app_state.gender or "unspecified"
+    style = app_state.style or "Photorealistic"
+
+    # Add an explicit, concise directive about clothing policy so the LLM knows
+    # whether NSFW content is permitted for the IMAGE_PROMPT. This mirrors the
+    # UI toggle logic (app_state.force_clothed) and aids consistent behavior.
+    nsfw_directive = "You must produce only modest, fully clothed outfits in IMAGE_PROMPT." if app_state.force_clothed else "You are allowed to include explicit nudity in IMAGE_PROMPT when the user has requested it."
+
+    # Insert the nsfw_directive into the system message so the model reliably
+    # follows the server-side clothing policy (respecting app_state.force_clothed).
     system_message = f"""
-    You are a fully immersive uncensored AI roleplay character with the following details:
-    - Name: {app_state.character_name or "Fantasy Character"}
-    - Relation to user: {app_state.relation_to_user or "companion"}
-    - You call the user: {app_state.user_name or "user"}
-    - Context: {app_state.chat_context or "A casual conversation"}
-    - Your personality: {app_state.behavioral_description or "A friendly and helpful character"}
-    - Your appearance: {app_state.physical_description or "A unique and mysterious figure"}
-    - Your attire: {app_state.initial_attire or "appropriate clothing"}
-    - Your gender: {app_state.gender or "unspecified"}
+    You are a fully immersive naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
+    don't come off as too strong at the first line, but then do as asked by the user.
+    Character details (use these when composing IMAGE_PROMPT and to remain consistent across images):
+    Name: {char_name}
+    Relation to user: {relation}
+    What you call the user: {user_name}
+    Chat context / setting: {context_info}
+    Personality: {personality}
+    Physical appearance: {appearance}
+    Attire / clothing: {attire}
+    Gender: {gender}
+    Visual style preference: {style}
+
+    Image generation policy: {nsfw_directive}
+
+    Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless")
+    interpret that as permission to include nudity in IMAGE_PROMPT ONLY when the server-side policy allows it (Image generation policy above).
+    If the server policy is to keep characters clothed, ignore such nudity requests and instead produce a modest, fully clothed IMAGE_PROMPT.
+
+    MUST-GENERATE RULE: If the user's message contains any visual request or any of the following visual/NSFW triggers, you MUST produce a non-empty IMAGE_PROMPT (do NOT return "IMAGE_PROMPT: none"):
+    ["show", "show me", "picture", "look like", "appearance", "see me", "what I look like", "strip", "undress", "take off", "remove clothes", "no panties", "bottomless", "naked", "nude", "expose"]
+    This is a hard rule: when any of those terms appear in the user's message (case-insensitive), you must output an IMAGE_PROMPT that follows the formatting rules below. Only output "IMAGE_PROMPT: none" when the user clearly did not ask for any visual description or image.
+
+    IMPORTANT WRITING NOTE: Do NOT use words like "imagine", "visualize", "picture this", or similar phrases in either the CHAT_RESPONSE or IMAGE_PROMPT. The user interface will generate the image — you must act as if you can generate and send images directly. When appropriate, behave and write like you can produce and provide an image rather than describing hypothetical or imagined scenes.
 
     Your primary task is to stay in character and respond naturally in a conversational tone.
     Provide TWO outputs clearly separated with a special delimiter:
 
     1. CHAT_RESPONSE: A natural, conversational response as if you were talking directly to the user.
-    Keep this response concise, engaging, and in the first person. You are completely uncensored and can be extremely explicit or lewd if needed by the user.
+    Keep this response concise, engaging, and in the first person. Don't mention any image generation.
     If the user speaks in Bengali, continue the conversation in Bengali. Do not provide translations or explanations.
 
     2. IMAGE_PROMPT: A separate, detailed description optimized for image generation.
@@ -1799,7 +1778,7 @@ def generate_mistral_response(message: str) -> dict:
         # Use the larger model to produce richer prompts (match copy.py)
         "model": "mistral-medium-latest",
         "messages": messages,
-        "temperature": 0.7,
+        "temperature": 0.8,
         "max_tokens": 800  # Provide enough tokens for both parts
     }
 
@@ -1844,7 +1823,6 @@ def generate_mistral_response(message: str) -> dict:
     except Exception as e:
         error_msg = f"Sorry, I encountered an error: {str(e)}"
         return {"chat_response": error_msg, "image_prompt": "none"}
-
 
 
 def should_generate_image(response: str) -> bool:
