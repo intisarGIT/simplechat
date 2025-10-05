@@ -391,7 +391,11 @@ def swap_face(source_face, source_img, target_path, output_path):
         try:
             rapidapi_key = RAPIDAPI_HARDCODE or app_state.rapidapi_key or os.getenv("RAPIDAPI_KEY", "")
             rapidapi_host = app_state.rapidapi_host or os.getenv("RAPIDAPI_HOST", "faceswap-image-transformation-api1.p.rapidapi.com")
-            if rapidapi_key:
+
+            # Debug: clearly log whether we have a RapidAPI key/host and what will be attempted
+            if not rapidapi_key:
+                print(f"RapidAPI key not configured; skipping RapidAPI. rapidapi_host={rapidapi_host}")
+            else:
                 # Prefer base64 endpoint since we have local files
                 with open(template_path, "rb") as f:
                     src_b64 = base64.b64encode(f.read()).decode('utf-8')
@@ -404,6 +408,7 @@ def swap_face(source_face, source_img, target_path, output_path):
                     "x-rapidapi-host": rapidapi_host,
                     "Content-Type": "application/json"
                 }
+                print(f"Attempting RapidAPI faceswap at {rapid_url} with host header '{rapidapi_host}' and key present: {bool(rapidapi_key)}")
                 # Determine whether to ask the API to match gender.
                 # Prefer the explicit character gender saved in app_state; if not set,
                 # fall back to a simple heuristic using the character physical description.
