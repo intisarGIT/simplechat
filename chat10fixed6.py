@@ -1392,7 +1392,7 @@ def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
                 "height": 768,
                 "steps": 30,
                 "cfg_scale": 7.5,
-                "sampler": "k_euler_a",
+                "sampler_name": "k_euler_a",
                 "clip_skip": 1,
                 "nsfw": True
             }
@@ -1444,7 +1444,7 @@ def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
                         gens = jd.get('generations') or jd.get('images') or []
                         if gens and isinstance(gens, list) and len(gens) > 0:
                             gen = gens[0]
-                            img_b64 = gen.get('img') or gen.get('b64') or gen.get('image')
+                            img_b64 = gen.get('img') or gen.get('b64') or gen.get('image') or gen.get('base64')
                             if img_b64:
                                 image_bytes = base64.b64decode(img_b64)
                                 output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
@@ -1457,6 +1457,72 @@ def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
                                         f.write(image_bytes)
                                 app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
                                 return output_filename, "Image generated via Horde fallback"
+                        # If done but no generations present, try alternative result endpoints
+                        print(f"Horde job {job_id} marked done but no generations found; trying alternative result endpoints")
+                        alt_paths = [
+                            f"https://aihorde.net/api/v2/generate/result/{job_id}",
+                            f"https://aihorde.net/api/v2/generate/status/{job_id}",
+                            f"https://stablehorde.net/api/v2/generate/status/{job_id}",
+                            f"https://stablehorde.net/api/v2/generate/result/{job_id}",
+                            f"https://aihorde.net/api/v2/generate/{job_id}",
+                            f"https://stablehorde.net/api/v2/generate/{job_id}"
+                        ]
+
+                        def find_base64_in_obj(obj):
+                            # Recursively search for long base64-like strings in JSON
+                            if isinstance(obj, str):
+                                s = obj.strip()
+                                # common img prefixes for JPEG/PNG
+                                if s.startswith('/9j/') or s.startswith('iVBOR') or (len(s) > 100 and all(c.isalnum() or c in '+/=' for c in s.replace('\n','').replace('\r',''))):
+                                    return s
+                                return None
+                            if isinstance(obj, dict):
+                                for k, v in obj.items():
+                                    if isinstance(k, str) and k.lower() in ('img','image','b64','base64','result'):
+                                        if isinstance(v, str) and len(v) > 50:
+                                            return v
+                                    res = find_base64_in_obj(v)
+                                    if res:
+                                        return res
+                            if isinstance(obj, list):
+                                for item in obj:
+                                    res = find_base64_in_obj(item)
+                                    if res:
+                                        return res
+                            return None
+
+                        for alt in alt_paths:
+                            try:
+                                print(f"Trying alternative Horde result endpoint: {alt}")
+                                rr = requests.get(alt, headers=headers, timeout=30)
+                                print(f"Alt endpoint {alt} returned {rr.status_code}")
+                                if rr.status_code == 200:
+                                    try:
+                                        payload = rr.json()
+                                    except Exception:
+                                        payload = None
+                                    if payload:
+                                        b64 = find_base64_in_obj(payload)
+                                        if b64:
+                                            try:
+                                                image_bytes = base64.b64decode(b64)
+                                                output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
+                                                output_path = os.path.join(OUTPUT_DIR, output_filename)
+                                                try:
+                                                    img = Image.open(BytesIO(image_bytes)).convert("RGB")
+                                                    img.save(output_path, format="JPEG", quality=95)
+                                                except Exception:
+                                                    with open(output_path, 'wb') as f:
+                                                        f.write(image_bytes)
+                                                app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
+                                                print(f"Saved Horde image from alt endpoint {alt} to {output_path}")
+                                                return output_filename, "Image generated via Horde fallback (alt endpoint)"
+                                            except Exception as e:
+                                                print(f"Failed to decode/save image from alt endpoint {alt}: {e}")
+                            except Exception as e:
+                                print(f"Error fetching alt endpoint {alt}: {e}")
+                        # nothing found in alt endpoints; continue polling
+                        continue
                 else:
                     print(f"Horde check {job_id} returned {r.status_code}: {r.text}")
             except Exception as e:
