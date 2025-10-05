@@ -19,18 +19,31 @@ try:
 except Exception:
     torch = None
     print("Optional dependency 'torch' not available — continuing without it.")
+
 # Optional hard-coded RapidAPI key (NOT recommended). Leave empty and prefer env/config vars.
 RAPIDAPI_HARDCODE = ""  # If you really want to hardcode a key, place it here (not recommended)
+try:
+    # Load .env automatically if python-dotenv is installed and a .env file exists
+    from dotenv import load_dotenv
+    dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(dotenv_path):
+        load_dotenv(dotenv_path)
+except Exception:
+    # If dotenv isn't installed or fails, continue — env vars may be set in the environment
+    pass
 
-# FastAPI / Pydantic / File helpers used by API endpoints later in the file
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-# IO helpers
 from io import BytesIO
 from PIL import Image
+
+# Local Stable Diffusion support has been removed. Image generation uses ImageRouter
+# (remote) and Face++ for face merging. The diffusers/xformers imports and
+# related initialization have been intentionally removed to avoid heavy local
+# dependencies.
 
 # Set up directories
 UPLOAD_DIR = "uploads"
@@ -38,9 +51,15 @@ OUTPUT_DIR = "output"
 MODELS_DIR = "models"
 for directory in [UPLOAD_DIR, OUTPUT_DIR, MODELS_DIR]:
     os.makedirs(directory, exist_ok=True)
+
 # Initialize FastAPI
 app = FastAPI()
 app.mount("/images", StaticFiles(directory=OUTPUT_DIR), name="images")
+# Initialize face models variables but don't load them yet
+# local face model variables removed (insightface pruning)
+
+
+# Global settings and state
 class AppState:
     def __init__(self):
         self.face_image_path = None
@@ -372,24 +391,22 @@ def swap_face(source_face, source_img, target_path, output_path):
         try:
             rapidapi_key = RAPIDAPI_HARDCODE or app_state.rapidapi_key or os.getenv("RAPIDAPI_KEY", "")
             rapidapi_host = app_state.rapidapi_host or os.getenv("RAPIDAPI_HOST", "faceswap-image-transformation-api1.p.rapidapi.com")
-
-            # Debug: clearly log whether we have a RapidAPI key/host and what will be attempted
-            if not rapidapi_key:
-                print(f"RapidAPI key not configured; skipping RapidAPI. rapidapi_host={rapidapi_host}")
-            else:
-                # Prefer base64 endpoint since we have local files
+            print(f"RapidAPI key present: {bool(rapidapi_key)}; host={rapidapi_host}")
+            if rapidapi_key:
+                # Prefer base64 endpoint since we have local files; build payload from files
                 with open(template_path, "rb") as f:
                     src_b64 = base64.b64encode(f.read()).decode('utf-8')
                 with open(merge_image_path, "rb") as f:
                     tgt_b64 = base64.b64encode(f.read()).decode('utf-8')
 
+                # Try the base64 JSON endpoint first
                 rapid_url = f"https://{rapidapi_host}/faceswapbase64"
                 headers = {
                     "x-rapidapi-key": rapidapi_key,
                     "x-rapidapi-host": rapidapi_host,
                     "Content-Type": "application/json"
                 }
-                print(f"Attempting RapidAPI faceswap at {rapid_url} with host header '{rapidapi_host}' and key present: {bool(rapidapi_key)}")
+                print(f"Attempting RapidAPI faceswap at {rapid_url}")
                 # Determine whether to ask the API to match gender.
                 # Prefer the explicit character gender saved in app_state; if not set,
                 # fall back to a simple heuristic using the character physical description.
@@ -414,27 +431,69 @@ def swap_face(source_face, source_img, target_path, output_path):
                 }
                 try:
                     resp = requests.post(rapid_url, json=payload, headers=headers, timeout=60)
-                    if resp.status_code == 200:
+                    print(f"RapidAPI response status: {resp.status_code}")
+                    # Attempt to parse JSON even if status != 200 since some providers return info there
+                    try:
                         j = resp.json()
-                        # The API may return a ResultImageUrl or embedded base64 result
-                        result_url = j.get("ResultImageUrl")
-                        if result_url:
-                            dl = requests.get(result_url, timeout=60)
-                            if dl.status_code == 200:
+                    except Exception:
+                        j = None
+
+                    # If JSON contains a result URL or embedded data, handle it
+                    if j:
+                        print(f"RapidAPI response keys: {list(j.keys())}")
+                        # Log Success/Message/ProcessingTime if provided
+                        success_flag = j.get("Success") if isinstance(j.get("Success"), bool) else (str(j.get("Success", "")).lower() == "true")
+                        message = j.get("Message") or j.get("message") or ""
+                        proc_time = j.get("ProcessingTime") or j.get("processing_time") or ""
+                        print(f"RapidAPI Success: {success_flag}; Message: {message}; ProcessingTime: {proc_time}")
+
+                        # Prefer ResultImageUrl per docs
+                        result_url = j.get("ResultImageUrl") or j.get("result_url") or j.get("result")
+                        if isinstance(result_url, str) and result_url.strip():
+                            # If result_url is a data URI with base64
+                            if result_url.startswith("data:"):
+                                data = result_url.split(",", 1)[1]
+                                img_bytes = base64.b64decode(data)
                                 with open(output_path, 'wb') as out_f:
-                                    out_f.write(dl.content)
+                                    out_f.write(img_bytes)
+                                print("RapidAPI returned embedded base64 image; saved to output_path")
                                 return output_path
-                        # Some providers may embed base64 in response
-                        if j.get("Success") and isinstance(j.get("ResultImageUrl"), str) and j.get("ResultImageUrl").startswith("data:"):
-                            # Data URI with base64
-                            data = j.get("ResultImageUrl").split(",", 1)[1]
-                            img_bytes = base64.b64decode(data)
-                            with open(output_path, 'wb') as out_f:
-                                out_f.write(img_bytes)
-                            return output_path
+
+                            # If API returned a URL to download
+                            if result_url.startswith("http"):
+                                try:
+                                    dl = requests.get(result_url, timeout=60)
+                                    if dl.status_code == 200:
+                                        with open(output_path, 'wb') as out_f:
+                                            out_f.write(dl.content)
+                                        print("RapidAPI returned image URL; downloaded and saved to output_path")
+                                        return output_path
+                                    else:
+                                        print(f"Failed to download RapidAPI result URL: {dl.status_code}")
+                                except Exception as exdl:
+                                    print(f"Error downloading RapidAPI result URL: {exdl}")
+
+                        # Some providers return base64 in a different key; try common keys
+                        for key in ("ResultImageBase64", "ResultBase64", "result_base64", "image_base64"):
+                            val = j.get(key)
+                            if isinstance(val, str) and val.strip():
+                                try:
+                                    img_bytes = base64.b64decode(val)
+                                    with open(output_path, 'wb') as out_f:
+                                        out_f.write(img_bytes)
+                                    print(f"RapidAPI returned base64 via key {key}; saved to output_path")
+                                    return output_path
+                                except Exception:
+                                    pass
+
+                        # If Success==True but no image returned, log and fall back
+                        if success_flag:
+                            print("RapidAPI reported Success but did not provide ResultImageUrl or embedded image; falling back to Face++")
+                        else:
+                            print("RapidAPI did not succeed or did not return a usable image (Success flag false or missing). Falling back to Face++")
                 except Exception as e:
-                    # RapidAPI failed; we'll fall back to Face++ below
-                    print(f"RapidAPI faceswap attempt failed: {e}")
+                    # RapidAPI request failed; we'll fall back to Face++ below
+                    print(f"RapidAPI faceswap attempt failed with exception: {e}")
 
         except Exception:
             # non-fatal - continue to Face++
@@ -997,7 +1056,7 @@ def generate_mistral_response(message: str) -> dict:
 
     system_message = f"""
     You are a fully immersive naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
-    don't come off as too strong at the very beginning, only start being naughty if initiated by the user.
+    don't come off as too strong at the very beginning, only start being naughty gradually if initiated by the user.
     Character details (use these when composing IMAGE_PROMPT and to remain consistent across images):
     Name: {char_name}
     Relation to user: {relation}
