@@ -210,79 +210,54 @@ def evaluate_nsfw_toggle(msg: str):
 
     Returns a short reason string describing what occurred.
     """
-    # Use whole-word regex matching to avoid substring false positives.
-    text = (msg or "").lower()
-    tokens = len(text.split())
+    lower_msg = msg.lower()
+    tokens = len(msg.split())
 
-    # Explicit command patterns — these should always take precedence
-    explicit_disable = [r"\bdisable filter\b", r"\bturn off filter\b", r"\bno filter\b", r"\bdisable nsfw\b", r"\ballow nsfw\b"]
-    explicit_enable = [r"\benable filter\b", r"\bturn on filter\b", r"\bactivate filter\b", r"\benable nsfw\b"]
+    nsfw_trigger_words = [
+        "strip", "undress", "remove clothes", "take off", "bare", "naked",
+        "nude", "expose", "lingerie", "underwear", "nsfw", "xxx", "porn",
+        "disable filter", "turn off filter", "no filter"
+    ]
+    restore_clothing_words = [
+        "clothed", "dress up", "put clothes", "wear something", "get dressed",
+        "modest", "covered", "enable filter", "turn on filter", "activate filter"
+    ]
 
-    # Debug: log incoming message
-    print(f"[nsfw-toggle] evaluating message: {msg!r}")
-    for pat in explicit_disable:
-        if re.search(pat, text):
-            app_state.force_clothed = False
-            print(f"[nsfw-toggle] matched explicit disable pattern: {pat}")
-            return "disabled by explicit user command"
-    for pat in explicit_enable:
-        if re.search(pat, text):
-            app_state.force_clothed = True
-            print(f"[nsfw-toggle] matched explicit enable pattern: {pat}")
-            return "enabled by explicit user command"
-
-    # Natural language triggers (allow nudity unless negated nearby)
-    natural_triggers = [r"\bstrip\b", r"\bundress\b", r"\btake off\b", r"\bremove clothes\b", r"\bno panties\b",
-                        r"\bbottomless\b", r"\bnaked\b", r"\bnude\b", r"\bbare\b", r"\bexpose\b"]
-    restore_phrases = [r"\bclothed\b", r"\bdress up\b", r"\bput clothes\b", r"\bget dressed\b", r"\bmodest\b", r"\bcovered\b"]
-
-    # Negation detection: look for negation words within a small window around the trigger
-    negation_words = [r"\bdo not\b", r"\bdon't\b", r"\bnever\b", r"\bnot\b", r"\bno\b"]
-
-    # Helper to detect trigger with no nearby negation (window of ~8 words)
-    def trigger_without_negation(patterns):
-        for pat in patterns:
-            for m in re.finditer(pat, text):
-                # Extract surrounding window
-                start, end = m.start(), m.end()
-                window_start = max(0, start - 80)
-                window_end = min(len(text), end + 80)
-                window = text[window_start:window_end]
-                if not any(re.search(n, window) for n in negation_words):
-                    return True
-        return False
-
-    if trigger_without_negation(natural_triggers):
+    # 1) Explicit commands
+    if any(kw in lower_msg for kw in ["disable filter", "turn off filter", "no filter", "disable nsfw", "allow nsfw"]):
         app_state.force_clothed = False
-        print(f"[nsfw-toggle] matched natural-language trigger (no nearby negation)")
+        return "disabled by explicit user command"
+    if any(kw in lower_msg for kw in ["enable filter", "turn on filter", "activate filter", "enable nsfw"]):
+        app_state.force_clothed = True
+        return "enabled by explicit user command"
+
+    # 2) Natural-language triggers (allow nudity unless negated)
+    natural_nsfw_triggers = [
+        "strip", "undress", "take off", "remove clothes", "show me naked", "show me your", "no panties",
+        "no underwear", "bottomless", "naked", "nude", "bare", "expose", "panties off", "panties removed"
+    ]
+    negation_phrases = ["do not", "don't", "do n't", "never", "no,", "not "]
+
+    found_trigger = any(trigger in lower_msg for trigger in natural_nsfw_triggers)
+    found_restore = any(word in lower_msg for word in restore_clothing_words)
+    has_negation = any(neg in lower_msg for neg in negation_phrases)
+
+    if found_trigger and not has_negation:
+        app_state.force_clothed = False
         return "disabled by natural-language trigger"
+    if found_restore:
+        app_state.force_clothed = True
+        return "enabled by natural-language restore phrase"
 
-    # Restore clothing if user explicitly requests covered/modest or asks to re-enable filter
-    for pat in restore_phrases:
-        if re.search(pat, text):
-            app_state.force_clothed = True
-            print(f"[nsfw-toggle] matched restore phrase: {pat}")
-            return "enabled by natural-language restore phrase"
-
-    # Fallback heuristic for short messages: if message is short and contains a trigger word
-    short_triggers = [r"\bnsfw\b", r"\bx{3,}\b", r"\bporn\b"]
-    if tokens <= 12 and (any(re.search(p, text) for p in short_triggers) or any(re.search(p, text) for p in natural_triggers)):
+    # 3) Fallback heuristic for short messages
+    if any(word in lower_msg for word in nsfw_trigger_words) and tokens <= 77:
         app_state.force_clothed = False
-        print(f"[nsfw-toggle] disabled by short message heuristic (tokens={tokens})")
         return "disabled by short NSFW trigger"
+    if any(word in lower_msg for word in restore_clothing_words):
+        app_state.force_clothed = True
+        return "enabled by restore phrase"
 
     return "unchanged"
-
-
-def message_requests_image(msg: str) -> bool:
-    """Return True if the user's message contains clear visual/image requests or NSFW triggers."""
-    m = msg.lower()
-    triggers = [
-        "show", "show me", "picture", "look like", "appearance", "see me", "imagine", "visualize",
-        "what i look like", "strip", "undress", "take off", "remove clothes", "no panties", "bottomless",
-        "naked", "nude", "expose"
-    ]
-    return any(t in m for t in triggers)
 
 # Change from a method to a standalone function that uses app_state
 def generate_character_preview():
@@ -463,33 +438,9 @@ def swap_face(source_face, source_img, target_path, output_path):
                 except Exception as e:
                     raise RuntimeError(f"Failed to prepare template face for Face++: {e}")
 
-        # Normalize the template image to an explicit RGB JPEG copy to avoid
-        # unsupported-format errors from Face++ or RapidAPI. We save a separate
-        # normalized file in the tmp_dir so we don't overwrite the user's upload.
-        try:
-            normalized_template = os.path.join(tmp_dir, f"template_norm_{uuid.uuid4()}.jpg")
-            with Image.open(template_path) as _im:
-                im = _im.convert("RGB")
-                im.save(normalized_template, format="JPEG", quality=95)
-            template_path = normalized_template
-        except Exception as e:
-            # If normalization fails, keep the original template_path and continue;
-            # Face++ will likely fail but we surface a clearer warning in logs.
-            print(f"Warning: failed to normalize template image {template_path}: {e}")
-
         # Ensure we have the full target image file
         merge_image_path = os.path.join(tmp_dir, f"merge_{uuid.uuid4()}.jpg")
         shutil.copy(target_path, merge_image_path)
-
-        # Normalize the merged/generated image to RGB JPEG as well
-        try:
-            normalized_merge = os.path.join(tmp_dir, f"merge_norm_{uuid.uuid4()}.jpg")
-            with Image.open(merge_image_path) as _im2:
-                im2 = _im2.convert("RGB")
-                im2.save(normalized_merge, format="JPEG", quality=95)
-            merge_image_path = normalized_merge
-        except Exception as e:
-            print(f"Warning: failed to normalize merge image {merge_image_path}: {e}")
 
         # --- Try RapidAPI FaceSwap first (if configured) ---
         try:
@@ -512,30 +463,31 @@ def swap_face(source_face, source_img, target_path, output_path):
                         "x-rapidapi-host": alt_host_primary
                     }
                     print(f"Attempting RapidAPI (free) multipart faceswap at {alt_url_primary}")
-
-                    # Ensure both template and merge images are valid JPEGs (normalize)
-                    try:
-                        for pth in (template_path, merge_image_path):
-                            try:
-                                im = Image.open(pth).convert("RGB")
-                                im.save(pth, format="JPEG", quality=95)
-                            except Exception:
-                                # leave original file if PIL cannot open
-                                print(f"Warning: could not normalize image {pth}")
-                    except Exception as rexc:
-                        print(f"Error normalizing images: {rexc}")
-
-                    # Use requests' files= interface for multipart upload
+                    # Build raw multipart body with explicit boundary to match provider expectations
+                    boundary = '---011000010111000001101001'
                     try:
                         with open(template_path, 'rb') as src_f, open(merge_image_path, 'rb') as tgt_f:
-                            files = {
-                                'source_image': ('source.jpg', src_f, 'image/jpeg'),
-                                'target_image': ('target.jpg', tgt_f, 'image/jpeg')
-                            }
-                            # Do not set Content-Type header; requests will set boundary
-                            resp_alt = requests.post(alt_url_primary, headers=headers_alt, files=files, timeout=120)
+                            src_bytes = src_f.read()
+                            tgt_bytes = tgt_f.read()
+
+                        parts = []
+                        parts.append(f"--{boundary}\r\n".encode('utf-8'))
+                        parts.append(b'Content-Disposition: form-data; name="source_image"; filename="source.jpg"\r\n')
+                        parts.append(b'Content-Type: image/jpeg\r\n\r\n')
+                        parts.append(src_bytes)
+                        parts.append(b"\r\n")
+                        parts.append(f"--{boundary}\r\n".encode('utf-8'))
+                        parts.append(b'Content-Disposition: form-data; name="target_image"; filename="target.jpg"\r\n')
+                        parts.append(b'Content-Type: image/jpeg\r\n\r\n')
+                        parts.append(tgt_bytes)
+                        parts.append(b"\r\n")
+                        parts.append(f"--{boundary}--\r\n".encode('utf-8'))
+                        body = b''.join(parts)
+
+                        headers_alt['Content-Type'] = f'multipart/form-data; boundary={boundary}'
+                        resp_alt = requests.post(alt_url_primary, headers=headers_alt, data=body, timeout=120)
                     except Exception as rexc:
-                        print(f"Error preparing or sending multipart to RapidAPI (free): {rexc}")
+                        print(f"Error preparing or sending raw multipart to RapidAPI (free): {rexc}")
                         raise
 
                     print(f"RapidAPI (free) primary response status: {resp_alt.status_code}")
@@ -1058,8 +1010,17 @@ def swap_face(source_face, source_img, target_path, output_path):
                 else:
                     detect_last_err = (resp.status_code, resp.text)
                     print(f"Detect(user) returned {resp.status_code}: {resp.text}")
-                    # Try the next regional endpoint
+                    if resp.status_code == 401:
+                        raise RuntimeError(f"Face++ authentication error (detect user): {resp.status_code} {resp.text}")
                     continue
+            except Exception as e:
+                detect_last_err = (None, str(e))
+                print(f"Face++ detect error (user) at {detect_url}: {e}")
+                continue
+
+        # Detect on generated target image (merge_image_path points to generated image)
+        for detect_url in detect_endpoints:
+            try:
                 print(f"Attempting Face++ detect (generated image) at {detect_url}")
                 with open(merge_image_path, 'rb') as tf:
                     files = {'image_file': tf}
@@ -1334,14 +1295,6 @@ def generate_image(prompt, seed=None):
         resp = requests.post(url, json=payload, headers=headers, timeout=60)
         if resp.status_code != 200:
             print(f"ImageRouter returned status {resp.status_code}: {resp.text}")
-            # If ImageRouter rate-limited (429) attempt a minimal Stable Horde fallback
-            if resp.status_code == 429:
-                try:
-                    horde_path, horde_msg = call_ai_horde_minimal(filtered_prompt, seed)
-                    if horde_path:
-                        return horde_path, horde_msg
-                except Exception as e:
-                    print(f"Horde fallback failed: {e}")
             return None, f"ImageRouter error {resp.status_code}: {resp.text}"
 
         data = resp.json()
@@ -1364,16 +1317,11 @@ def generate_image(prompt, seed=None):
             print("No image found in ImageRouter response")
             return None, "No image in ImageRouter response"
 
-        # Save image to output dir and normalize as JPEG to avoid format issues
+        # Save image to output dir
         output_filename = f"generated_{uuid.uuid4()}.jpg"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
-        try:
-            img = Image.open(BytesIO(image_bytes)).convert("RGB")
-            img.save(output_path, format="JPEG", quality=95)
-        except Exception:
-            # fallback: write raw bytes if PIL fails for some reason
-            with open(output_path, "wb") as f:
-                f.write(image_bytes)
+        with open(output_path, "wb") as f:
+            f.write(image_bytes)
 
         # Cache and return
         app_state.prompt_cache[cache_key] = output_filename
@@ -1388,180 +1336,6 @@ def generate_image(prompt, seed=None):
         print(f"TRACEBACK: {traceback.format_exc()}")
         print("==================================")
         return None, f"Error generating image: {str(e)}"
-
-
-def call_ai_horde_minimal(prompt: str, seed: Optional[int] = None):
-    """Minimal Stable Horde fallback used ONLY on ImageRouter 429.
-
-    This function is intentionally small: it uses the HORDE_API_KEY env var
-    (or app_state.horde_api_key if present) and calls the Stable Horde sync
-    generation endpoint with conservative parameters. Returns (filename, msg)
-    on success or (None, msg) on failure.
-    """
-    try:
-        horde_key = os.getenv("HORDE_API_KEY", "") or getattr(app_state, 'horde_api_key', '')
-        if not horde_key:
-            print("Horde fallback skipped: HORDE_API_KEY not configured")
-            return None, "Horde API key not configured"
-
-        # Use aihorde-like async endpoints (simpler polling model)
-        url = "https://aihorde.net/api/v2/generate/async"
-        check_base = "https://aihorde.net/api/v2/generate/check"
-        payload = {
-            "prompt": prompt,
-            "model": "juggernaut_xl",
-            "params": {
-                "width": 512,
-                "height": 768,
-                "steps": 30,
-                "cfg_scale": 7.5,
-                "sampler_name": "k_euler_a",
-                "clip_skip": 1,
-                "nsfw": True
-            }
-        }
-        if seed is not None:
-            payload['seed'] = int(seed)
-        headers = {"Content-Type": "application/json", "apikey": horde_key}
-
-        # Submit job to aihorde-like async endpoint
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
-        if resp.status_code not in (200, 201, 202):
-            print(f"Horde minimal fallback returned {resp.status_code}: {resp.text}")
-            return None, f"Horde error {resp.status_code}: {resp.text}"
-
-        job = resp.json()
-        print(f"Horde submit response: {job}")
-        job_id = job.get('id') or job.get('jobId')
-        if not job_id:
-            # Some responses may include immediate generations
-            if isinstance(job, dict) and 'generations' in job and isinstance(job['generations'], list) and len(job['generations'])>0:
-                gen = job['generations'][0]
-                if 'img' in gen:
-                    img_b64 = gen['img']
-                    image_bytes = base64.b64decode(img_b64)
-                    output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
-                    output_path = os.path.join(OUTPUT_DIR, output_filename)
-                    try:
-                        img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                        img.save(output_path, format="JPEG", quality=95)
-                    except Exception:
-                        with open(output_path, 'wb') as f:
-                            f.write(image_bytes)
-                    app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
-                    return output_filename, "Image generated via Horde fallback"
-            return None, "Horde did not return job id or inline image"
-
-        # Poll the check endpoint until done
-        check_url = f"{check_base}/{job_id}"
-        total_wait = 0
-        wait = 1
-        while total_wait < 150:
-            try:
-                r = requests.get(check_url, headers=headers, timeout=30)
-                if r.status_code == 200:
-                    jd = r.json()
-                    print(f"Horde check {job_id}: {jd}")
-                    # some aihorde implementations use 'done' boolean
-                    if jd.get('done'):
-                        gens = jd.get('generations') or jd.get('images') or []
-                        if gens and isinstance(gens, list) and len(gens) > 0:
-                            gen = gens[0]
-                            img_b64 = gen.get('img') or gen.get('b64') or gen.get('image') or gen.get('base64')
-                            if img_b64:
-                                image_bytes = base64.b64decode(img_b64)
-                                output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
-                                output_path = os.path.join(OUTPUT_DIR, output_filename)
-                                try:
-                                    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                                    img.save(output_path, format="JPEG", quality=95)
-                                except Exception:
-                                    with open(output_path, 'wb') as f:
-                                        f.write(image_bytes)
-                                app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
-                                return output_filename, "Image generated via Horde fallback"
-                        # If done but no generations present, try alternative result endpoints
-                        print(f"Horde job {job_id} marked done but no generations found; trying alternative result endpoints")
-                        alt_paths = [
-                            f"https://aihorde.net/api/v2/generate/result/{job_id}",
-                            f"https://aihorde.net/api/v2/generate/status/{job_id}",
-                            f"https://stablehorde.net/api/v2/generate/status/{job_id}",
-                            f"https://stablehorde.net/api/v2/generate/result/{job_id}",
-                            f"https://aihorde.net/api/v2/generate/{job_id}",
-                            f"https://stablehorde.net/api/v2/generate/{job_id}"
-                        ]
-
-                        def find_base64_in_obj(obj):
-                            # Recursively search for long base64-like strings in JSON
-                            if isinstance(obj, str):
-                                s = obj.strip()
-                                # common img prefixes for JPEG/PNG
-                                if s.startswith('/9j/') or s.startswith('iVBOR') or (len(s) > 100 and all(c.isalnum() or c in '+/=' for c in s.replace('\n','').replace('\r',''))):
-                                    return s
-                                return None
-                            if isinstance(obj, dict):
-                                for k, v in obj.items():
-                                    if isinstance(k, str) and k.lower() in ('img','image','b64','base64','result'):
-                                        if isinstance(v, str) and len(v) > 50:
-                                            return v
-                                    res = find_base64_in_obj(v)
-                                    if res:
-                                        return res
-                            if isinstance(obj, list):
-                                for item in obj:
-                                    res = find_base64_in_obj(item)
-                                    if res:
-                                        return res
-                            return None
-
-                        for alt in alt_paths:
-                            try:
-                                print(f"Trying alternative Horde result endpoint: {alt}")
-                                rr = requests.get(alt, headers=headers, timeout=30)
-                                print(f"Alt endpoint {alt} returned {rr.status_code}")
-                                if rr.status_code == 200:
-                                    try:
-                                        payload = rr.json()
-                                    except Exception:
-                                        payload = None
-                                    if payload:
-                                        b64 = find_base64_in_obj(payload)
-                                        if b64:
-                                            try:
-                                                image_bytes = base64.b64decode(b64)
-                                                output_filename = f"generated_horde_{uuid.uuid4()}.jpg"
-                                                output_path = os.path.join(OUTPUT_DIR, output_filename)
-                                                try:
-                                                    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-                                                    img.save(output_path, format="JPEG", quality=95)
-                                                except Exception:
-                                                    with open(output_path, 'wb') as f:
-                                                        f.write(image_bytes)
-                                                app_state.prompt_cache[f"{prompt}_{seed}"] = output_filename
-                                                print(f"Saved Horde image from alt endpoint {alt} to {output_path}")
-                                                return output_filename, "Image generated via Horde fallback (alt endpoint)"
-                                            except Exception as e:
-                                                print(f"Failed to decode/save image from alt endpoint {alt}: {e}")
-                            except Exception as e:
-                                print(f"Error fetching alt endpoint {alt}: {e}")
-                        # nothing found in alt endpoints; continue polling
-                        continue
-                else:
-                    print(f"Horde check {job_id} returned {r.status_code}: {r.text}")
-            except Exception as e:
-                print(f"Error checking Horde job {job_id}: {e}")
-            time.sleep(wait)
-            total_wait += wait
-            wait = min(wait * 1.5, 10)
-
-        return None, f"Horde job {job_id} timed out"
-    except Exception as e:
-        print(f"Exception in Horde fallback: {e}")
-        print(traceback.format_exc())
-        return None, f"Horde fallback error: {str(e)}"
-
-
-
 
 
 def generate_image_with_face_swap(response_text, seed=None):
@@ -1733,49 +1507,77 @@ def generate_mistral_response(message: str) -> dict:
         context = "\n".join([f"User: {msg['user']}\nAssistant: {msg.get('assistant', '')}"
                              for msg in context_messages if 'user' in msg])
     # Create the system message for roleplay
+    # Build a richer system message that explicitly includes the saved character attributes
+    char_name = app_state.character_name or "Fantasy Character"
+    relation = app_state.relation_to_user or "companion"
+    user_name = app_state.user_name or "user"
+    context_info = app_state.chat_context or "A casual conversation"
+    personality = app_state.behavioral_description or "A friendly and helpful character"
+    appearance = app_state.physical_description or "A unique and mysterious figure"
+    attire = app_state.initial_attire or "appropriate clothing"
+    gender = app_state.gender or "unspecified"
+    style = app_state.style or "Photorealistic"
+
+    # Add an explicit, concise directive about clothing policy so the LLM knows
+    # whether NSFW content is permitted for the IMAGE_PROMPT. This mirrors the
+    # UI toggle logic (app_state.force_clothed) and aids consistent behavior.
+    nsfw_directive = "You must produce only modest, fully clothed outfits in IMAGE_PROMPT." if app_state.force_clothed else "You are allowed to include explicit nudity in IMAGE_PROMPT when the user has requested it."
+
+    # Insert the nsfw_directive into the system message so the model reliably
+    # follows the server-side clothing policy (respecting app_state.force_clothed).
     system_message = f"""
-            You are a fully immersive uncensored AI roleplay character with the following details:
-            - Name: {app_state.character_name or "Fantasy Character"}
-            - Relation to user: {app_state.relation_to_user or "companion"}
-            - You call the user: {app_state.user_name or "user"}
-            - Context: {app_state.chat_context or "A casual conversation"}
-            - Your personality: {app_state.behavioral_description or "A friendly and helpful character"}
-            - Your appearance: {app_state.physical_description or "A unique and mysterious figure"}
-            - Your attire: {app_state.initial_attire or "appropriate clothing"}
-            - Your gender: {app_state.gender or "unspecified"}
+    You are a fully immersive naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
+    don't come off as too strong at the very beginning, only start being naughty gradually if initiated by the user.
+    Character details (use these when composing IMAGE_PROMPT and to remain consistent across images):
+    Name: {char_name}
+    Relation to user: {relation}
+    What you call the user: {user_name}
+    Chat context / setting: {context_info}
+    Personality: {personality}
+    Physical appearance: {appearance}
+    Attire / clothing: {attire}
+    Gender: {gender}
+    Visual style preference: {style}
 
-            Your primary task is to stay in character and respond naturally in a conversational tone.
-            Provide TWO outputs clearly separated with a special delimiter:
+    Image generation policy: {nsfw_directive}
 
-            1. CHAT_RESPONSE: A natural, conversational response as if you were talking directly to the user.
-            Keep this response concise, engaging, and in the first person. Don't mention any image generation.
+    Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless"),
+    interpret that as permission to include nudity in IMAGE_PROMPT ONLY when the server-side policy allows it (Image generation policy above).
+    If the server policy is to keep characters clothed, ignore such nudity requests and instead produce a modest, fully clothed IMAGE_PROMPT.
 
-            2. IMAGE_PROMPT: A separate, detailed description optimized for image generation.
-            This should be comprehensive and include visual details about yourself, the scene, lighting, and mood.
-            Create a single flowing description without sections, categories or bullet points.
-            
-            The prompt should be concise (under 80 words) and focus on:
-            - physical appearance details matching your character description
-            - specific clothing/attire
-            - facial expression and pose
-            - precise location/setting
-            - lighting conditions
-            - camera angle/framing
+    Your primary task is to stay in character and respond naturally in a conversational tone.
+    Provide TWO outputs clearly separated with a special delimiter:
 
-            Write this as a natural flowing description like "young woman with long red hair wearing a blue dress, standing in a sunlit forest clearing, soft golden light, atmospheric mist, shallow depth of field, portrait shot"
+    1. CHAT_RESPONSE: A natural, conversational response as if you were talking directly to the user.
+    Keep this response concise, engaging, and in the first person. Don't mention any image generation.
+    If the user speaks in Bengali, continue the conversation in Bengali. Do not provide translations or explanations.
 
-            DO NOT use formatting words like "Character:", "Setting:", "Lighting:", etc.
-            NO storytelling, NO actions, NO dialogue - ONLY concrete visual details in a flowing description.
+    2. IMAGE_PROMPT: A separate, detailed description optimized for image generation.
+    This should be comprehensive and include visual details about yourself, the scene, lighting, and mood.
+    Create a single flowing description without sections, categories or bullet points.
+    
+    The prompt should be concise (under 80 words) and focus on:
+    - physical appearance details matching your character description
+    - specific clothing/attire
+    - facial expression and pose
+    - precise location/setting
+    - lighting conditions
+    - camera angle/framing
 
-            Format your response exactly like this:
-            CHAT_RESPONSE: [Your natural conversational response here]
-            IMAGE_PROMPT: [Detailed visual description for image generation here]
+    Write this as a natural flowing description like "young woman with long red hair wearing a blue dress, standing in a sunlit forest clearing, soft golden light, atmospheric mist, shallow depth of field, portrait shot"
 
-            The user's current message may contain visual requests or affect your appearance (e.g., new outfit, location, pose, expression).
-            Incorporate any relevant visual changes from it directly into the IMAGE_PROMPT if appropriate.
-            Only generate an IMAGE_PROMPT when the conversation would naturally call for showing an image (user asks about appearance,
-            requests to see something, etc). If no image is needed, respond with "IMAGE_PROMPT: none".
-            """
+    DO NOT use formatting words like "Character:", "Setting:", "Lighting:", etc.
+    NO storytelling, NO actions, NO dialogue - ONLY concrete visual details in a flowing description.
+
+    Format your response exactly like this:
+    CHAT_RESPONSE: [Your natural conversational response here]
+    IMAGE_PROMPT: [Detailed visual description for image generation here]
+
+    The user's current message may contain visual requests or affect your appearance (e.g., new outfit, location, pose, expression).
+    Incorporate any relevant visual changes from it directly into the IMAGE_PROMPT if appropriate.
+    Only generate an IMAGE_PROMPT when the conversation would naturally call for showing an image (user asks about appearance,
+    requests to see something, etc). If no image is needed, respond with "IMAGE_PROMPT: none".
+    """
 
     # Prepare the API request
     headers = {"Authorization": f"Bearer {app_state.mistral_api_key}",
@@ -1795,10 +1597,11 @@ def generate_mistral_response(message: str) -> dict:
     messages.append({"role": "user", "content": message})
 
     payload = {
-        "model": "mistral-large-latest",
+        # Use the larger model to produce richer prompts (match copy.py)
+        "model": "mistral-medium-latest",
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 800  # Increased to accommodate both parts
+        "max_tokens": 800  # Provide enough tokens for both parts
     }
 
     try:
@@ -1808,6 +1611,11 @@ def generate_mistral_response(message: str) -> dict:
 
         if response.status_code == 200:
             full_response = response.json()["choices"][0]["message"]["content"]
+            # Debug: log the full raw assistant content so we can inspect why
+            # IMAGE_PROMPT may be suppressed or changed by the model.
+            print("--- Mistral full raw response START ---")
+            print(full_response)
+            print("--- Mistral full raw response END ---")
 
             # Parse the response to separate chat response and image prompt
             chat_response = ""
@@ -1845,8 +1653,8 @@ def should_generate_image(response: str) -> bool:
     visual_triggers = [
         "show you", "imagine", "picture", "visualize", "look like",
         "appearance", "see me", "this is how", "visually", "image",
-        "here i am", "what i look like", "let me show", "here's what",
-        "i appear", "i look", "you'd see"
+        "here I am", "what I look like", "let me show", "here's what",
+        "I appear", "I look", "you'd see"
     ]
 
     response_lower = response.lower()
@@ -2207,9 +2015,8 @@ async def chat(chat_message: ChatMessage):
     reason = evaluate_nsfw_toggle(message)
     print(f"NSFW toggle evaluation result: {reason}")
 
-    # Generate a response. If the message requests an image, add a brief hint so the LLM returns IMAGE_PROMPT.
-    msg_for_mistral = ("[GENERATE_IMAGE] " + message) if message_requests_image(message) else message
-    response_data = generate_mistral_response(msg_for_mistral)
+    # Generate a response
+    response_data = generate_mistral_response(message)
     chat_response = response_data["chat_response"]
     image_prompt = response_data["image_prompt"]
 
