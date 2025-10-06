@@ -1076,8 +1076,15 @@ def generate_image(prompt, seed=None):
         
         print(f"Using model: {selected_model} (NSFW prompt detected: {is_nsfw_prompt})")
         
+        # Enhance prompt for better NSFW results with HiDream
+        enhanced_prompt = prompt
+        if is_nsfw_prompt:
+            # Add emphasis and quality tags that might help bypass filters
+            enhanced_prompt = f"({prompt}), masterpiece, best quality, highly detailed, uncensored, explicit, NSFW, raw, unfiltered"
+            print(f"Enhanced NSFW prompt: {enhanced_prompt}")
+        
         payload = {
-            "prompt": prompt,
+            "prompt": enhanced_prompt,
             "model": selected_model,
             "response_format": "b64_json"
         }
@@ -1086,14 +1093,27 @@ def generate_image(prompt, seed=None):
         if seed is not None:
             payload["seed"] = seed
         
-        # Try to disable safety filters for NSFW content (if supported by HiDream)
+        # Try different approaches for NSFW content with HiDream
         if is_nsfw_prompt:
-            # These parameters may help with NSFW content generation
+            # Try multiple approaches since HiDream might have built-in filtering
             payload.update({
+                # Standard NSFW parameters
                 "safety_filter": False,
                 "nsfw": True,
                 "content_filter": False,
-                "safe_mode": False
+                "safe_mode": False,
+                # Alternative parameter names that some APIs use
+                "safety_checker": False,
+                "enable_safety_checker": False,
+                "apply_safety_filter": False,
+                "use_safety_filter": False,
+                "censor": False,
+                "enable_nsfw": True,
+                "allow_nsfw": True,
+                "explicit": True,
+                "uncensored": True,
+                # Try negative prompting approach
+                "negative_prompt": "clothes, clothing, covered, censored, blurred, modest, sfw"
             })
         headers = {
             "Authorization": f"Bearer {api_key}",
