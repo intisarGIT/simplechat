@@ -1748,16 +1748,26 @@ def generate_mistral_response(message: str) -> dict:
     MANDATORY RULE: When generating IMAGE_PROMPT, you MUST include the exact physical appearance "{appearance}" details. 
     DO NOT substitute with generic descriptions for physical features. Use the saved physical appearance verbatim.
     
-    ATTIRE RULE: Use "{attire}" as the default clothing, but you may change attire if:
+    ATTIRE RULE: Use "{attire}" as the default clothing, but you MUST change attire when:
     - User explicitly requests clothing changes ("take off", "change into", "wearing", etc.)
+    - User requests undressing, stripping, or nudity ("strip", "undress", "naked", "nude", etc.)
     - Conversation naturally progresses to different outfits or undressing
-    - NSFW content is permitted and user requests nudity
+    
+    CRITICAL NSFW RULE: When the Image generation policy allows NSFW content, you MUST follow user requests for:
+    - Partial or complete undressing ("take off dress", "strip", "remove clothes")
+    - Nudity ("naked", "nude", "topless", "bottomless", "no panties")
+    - Explicit clothing states ("wearing nothing", "completely naked", "bare breasts")
+    DO NOT default to clothed states when user explicitly requests nudity and NSFW is permitted.
     Always maintain the physical appearance "{appearance}" regardless of attire changes.
 
     Image generation policy: {nsfw_directive}
 
-    Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless")
+    Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless", "naked", "nude")
     interpret that as permission to include nudity in IMAGE_PROMPT ONLY when the server-side policy allows it (Image generation policy above).
+    
+    OVERRIDE RULE: When NSFW content is allowed AND user requests nudity, you MUST override the default attire and generate explicit nudity.
+    Do NOT use the saved default clothing when user explicitly asks for undressing/nudity and NSFW is permitted.
+    
     If the server policy is to keep characters clothed, ignore such nudity requests and instead produce a modest, fully clothed IMAGE_PROMPT.
 
     MUST-GENERATE RULE: If the user's message contains any visual request or any of the following visual/NSFW triggers, you MUST produce a non-empty IMAGE_PROMPT (do NOT return "IMAGE_PROMPT: none"):
@@ -1828,8 +1838,8 @@ def generate_mistral_response(message: str) -> dict:
         f"Visual style: {style}\n\n"
         f"FORBIDDEN: Do NOT use generic terms like 'mysterious woman', 'beautiful woman', 'attractive person' or any vague descriptions. "
         f"MANDATORY: Always use the EXACT physical appearance details: '{appearance}' in your IMAGE_PROMPT. "
-        f"ATTIRE FLEXIBILITY: Use '{attire}' as the default clothing, but if the user requests clothing changes (undressing, changing outfits, etc.), "
-        f"you may modify the attire accordingly while keeping the physical appearance '{appearance}' unchanged."
+        f"ATTIRE PRIORITY: If NSFW is enabled and user requests nudity/undressing, OVERRIDE default attire '{attire}' with the requested state. "
+        f"If no specific clothing request, use '{attire}' as default. ALWAYS keep physical appearance '{appearance}' unchanged."
     )
     
     # Debug: log the character attributes being sent
@@ -1851,6 +1861,20 @@ def generate_mistral_response(message: str) -> dict:
         print(f"[generate_mistral_response] WARNING: No specific character saved - using defaults!")
     
     messages.append({"role": "user", "content": char_attrs})
+    
+    # Add explicit nudity instruction if user requests it and NSFW is enabled
+    nudity_keywords = ["strip", "undress", "naked", "nude", "topless", "bottomless", "no panties", "take off", "remove clothes"]
+    user_requests_nudity = any(keyword in message.lower() for keyword in nudity_keywords)
+    
+    if user_requests_nudity and not app_state.force_clothed:
+        nudity_instruction = (
+            f"URGENT: User has explicitly requested nudity/undressing. Since NSFW is enabled, you MUST generate explicit nudity in IMAGE_PROMPT. "
+            f"Do NOT use default attire '{attire}'. Instead, show partial or complete nudity as requested. "
+            f"Keep physical appearance '{appearance}' but override clothing with requested nudity state."
+        )
+        messages.append({"role": "user", "content": nudity_instruction})
+        print(f"[generate_mistral_response] Added explicit nudity instruction - user requested: {[kw for kw in nudity_keywords if kw in message.lower()]}")
+    
     messages.append({"role": "user", "content": message})
 
     payload = {
