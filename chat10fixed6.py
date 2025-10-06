@@ -182,7 +182,9 @@ def generate_character_preview():
         app_state.source_img = source_img
 
         # Construct preview prompt
-        preview_prompt = f"{app_state.gender}, standing, {app_state.physical_description}, wearing {app_state.initial_attire}, {app_state.style}, high quality, intricate details"
+        base_preview_prompt = f"{app_state.gender}, standing, {app_state.physical_description}, wearing {app_state.initial_attire}, {app_state.style}, high quality"
+        # Apply quality enhancement
+        preview_prompt = enhance_prompt_with_quality_terms(base_preview_prompt)
         app_state.character_base_prompt = preview_prompt
 
         # Always generate a new random seed each time this function is called
@@ -1084,6 +1086,31 @@ def ensure_face_data_loaded():
 # Image Generation
 # =====================
 
+def enhance_prompt_with_quality_terms(prompt):
+    """Enhance any prompt with fixed quality terms for better image generation"""
+    if not prompt or prompt.lower().strip() == "none":
+        return prompt
+    
+    # Define quality enhancement terms
+    quality_terms = "photorealistic, intricate details, skin details, pores, vellus hair"
+    
+    # Check if quality terms are already present to avoid duplication
+    prompt_lower = prompt.lower()
+    has_photorealistic = "photorealistic" in prompt_lower
+    has_intricate = "intricate details" in prompt_lower or "intricate detail" in prompt_lower
+    
+    if has_photorealistic and has_intricate:
+        print(f"[PROMPT ENHANCE] Quality terms already present, skipping enhancement")
+        return prompt
+    
+    # Clean up the prompt (remove trailing punctuation for better appending)
+    cleaned_prompt = prompt.rstrip('. ,;')
+    
+    # Enhance the prompt by appending quality terms
+    enhanced_prompt = f"{cleaned_prompt}, {quality_terms}"
+    print(f"[PROMPT ENHANCE] Added quality terms: {quality_terms}")
+    return enhanced_prompt
+
 def generate_image(prompt, seed=None):
     """Generate an image using ImageRouter API and return (filename, message)"""
     try:
@@ -1117,12 +1144,16 @@ def generate_image(prompt, seed=None):
         
         print(f"Using model: {selected_model} (NSFW prompt detected: {is_nsfw_prompt})")
         
-        # Enhance prompt for better NSFW results with HiDream
-        enhanced_prompt = prompt
+        # First apply quality enhancement to all prompts
+        enhanced_prompt = enhance_prompt_with_quality_terms(prompt)
+        
+        # Then enhance further for NSFW results with HiDream
         if is_nsfw_prompt:
             # Add emphasis and quality tags that might help bypass filters
-            enhanced_prompt = f"({prompt}), masterpiece, best quality, highly detailed, uncensored, explicit, NSFW, raw, unfiltered"
+            enhanced_prompt = f"({enhanced_prompt}), masterpiece, best quality, highly detailed, uncensored, explicit, NSFW, raw, unfiltered"
             print(f"Enhanced NSFW prompt: {enhanced_prompt}")
+        else:
+            print(f"Enhanced prompt: {enhanced_prompt}")
         
         payload = {
             "prompt": enhanced_prompt,
@@ -1254,14 +1285,18 @@ def generate_image_pollinations(prompt, seed=None):
         import urllib.parse
         
         print("\n==== POLLINATIONS API FALLBACK STARTED =====")
-        print(f"PROMPT: {prompt}")
+        print(f"ORIGINAL PROMPT: {prompt}")
         print(f"SEED: {seed if seed is not None else 'random'}")
+        
+        # Apply quality enhancement to the prompt
+        enhanced_prompt = enhance_prompt_with_quality_terms(prompt)
+        print(f"ENHANCED PROMPT: {enhanced_prompt}")
         
         # Get API key from app state or environment
         api_key = app_state.pollinations_api_key or os.getenv("POLLINATIONS_API_KEY", "")
         
-        # URL encode the prompt
-        encoded_prompt = urllib.parse.quote(prompt)
+        # URL encode the enhanced prompt
+        encoded_prompt = urllib.parse.quote(enhanced_prompt)
         
         # Build the API URL
         base_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
@@ -1714,6 +1749,7 @@ def generate_mistral_response(message: str) -> dict:
     2. IMAGE_PROMPT: A detailed visual description optimized for image generation.
     This should include visual details about yourself, the scene, lighting, and mood.
     Create a single flowing description without sections or bullet points.
+    Focus on high-quality, detailed descriptions that emphasize realistic textures and fine details.
 
     CLOTHING STATE CONSISTENCY RULES:
     - If current clothing state is 'nude': ALWAYS include "naked", "nude", "explicit nudity" unless user explicitly asks to dress
