@@ -95,6 +95,9 @@ class AppState:
         self.style = "Photorealistic"  # Default style
         self.character_base_prompt = ""
         self.character_seed = None
+        # Clothing state tracking - persists across images until explicitly changed
+        self.current_clothing_state = "dressed"  # Can be: "dressed", "topless", "bottomless", "nude", "custom"
+        self.current_clothing_description = None  # Stores custom clothing when changed from initial
         self.available_models = []  # Will store available SD models
         # ImageRouter API key (can be set via /set_api_settings or env IMAGEROUTER_API_KEY)
         # For security, prefer setting these as environment variables on the server
@@ -1601,6 +1604,10 @@ def generate_mistral_response(message: str) -> dict:
     style = app_state.style or "Photorealistic"
     
     print(f"[Character Info] Using: {char_name} - {appearance[:30]}...")
+    print(f"[Character Info] Initial attire: {attire}")
+    print(f"[Character Info] Current clothing state: {getattr(app_state, 'current_clothing_state', 'dressed')}")
+    if hasattr(app_state, 'current_clothing_description') and app_state.current_clothing_description:
+        print(f"[Character Info] Custom clothing: {app_state.current_clothing_description}")
 
 
     # Create character directive like app.py
@@ -1613,10 +1620,13 @@ def generate_mistral_response(message: str) -> dict:
         character_parts.append(f"This character should call the user: {app_state.user_name}.")
     if appearance and appearance != "A unique and mysterious figure":
         character_parts.append(f"Physical appearance: {appearance}.")
+    if attire and attire != "appropriate clothing":
+        character_parts.append(f"Default clothing/attire: {attire}.")
     if personality:
         character_parts.append(f"Personality: {personality}.")
     
     character_directive = " ".join(character_parts) if character_parts else ""
+    print(f"[Character Directive] {character_directive[:100]}{'...' if len(character_directive) > 100 else ''}")
     
     # Simple system message like app.py but adapted for our use case
     base_system = """You are a naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
@@ -1635,12 +1645,15 @@ def generate_mistral_response(message: str) -> dict:
     Focus on high-quality, detailed descriptions that emphasize realistic textures and fine details.
 
     CLOTHING STATE CONSISTENCY RULES:
+    - CURRENT CLOTHING STATE: {getattr(app_state, 'current_clothing_state', 'dressed')}
     - If current clothing state is 'nude': ALWAYS include "naked", "nude", "explicit nudity" unless user explicitly asks to dress
     - If current clothing state is 'topless': Include "topless", "bare chest/breasts" 
     - If current clothing state is 'bottomless': Include "bottomless", "naked lower body"
-    - If current clothing state is 'dressed': Include appropriate clothing descriptions
+    - If current clothing state is 'dressed': Include your default clothing/attire as specified in your character description
+    - If current clothing state is 'custom': Include the specific clothing the user requested
     - When user asks to change pose but NOT clothing, maintain the current clothing state
     - Only change clothing state when explicitly requested
+    - CLOTHING CHANGES PERSIST: Once clothing is changed, maintain that state in future images until explicitly told to change again
 
     IMPORTANT FOR NSFW REQUESTS: When user asks to "strip", "undress", "naked", "nude", "bottomless", "topless", "remove clothes", "show body parts", or any explicit content, you MUST include explicit anatomical terms in the IMAGE_PROMPT:
     - For female characters: include "breasts", "nipples", "vagina", "pussy" as appropriate
@@ -1819,6 +1832,115 @@ def extract_camera_angle(user_message: str) -> Optional[str]:
     elif any(kw in message for kw in ["from side", "profile", "side view", "look sideways", "side angle"]):
         return "from side"
     return None
+
+def detect_clothing_change_from_message(user_message):
+    """Detect if user is requesting a clothing change and update clothing state"""
+    message_lower = user_message.lower()
+    
+    # Detect nudity requests
+    if any(keyword in message_lower for keyword in ['strip', 'undress', 'naked', 'nude', 'take off', 'remove clothes', 'get naked']):
+        app_state.current_clothing_state = "nude"
+        app_state.current_clothing_description = None
+        print(f"[Clothing State] Changed to: {app_state.current_clothing_state}")
+        return
+    
+    # Detect partial nudity
+    if any(keyword in message_lower for keyword in ['topless', 'remove top', 'show breasts', 'bare chest']):
+        app_state.current_clothing_state = "topless"
+        app_state.current_clothing_description = None
+        print(f"[Clothing State] Changed to: {app_state.current_clothing_state}")
+        return
+        
+    if any(keyword in message_lower for keyword in ['bottomless', 'remove bottom', 'no pants', 'no underwear']):
+        app_state.current_clothing_state = "bottomless"
+        app_state.current_clothing_description = None
+        print(f"[Clothing State] Changed to: {app_state.current_clothing_state}")
+        return
+    
+    # Detect getting dressed or clothing changes
+    if any(keyword in message_lower for keyword in ['get dressed', 'put on clothes', 'dress up', 'wear clothes']):
+        app_state.current_clothing_state = "dressed"
+        app_state.current_clothing_description = None
+        print(f"[Clothing State] Changed to: {app_state.current_clothing_state} (back to initial attire)")
+        return
+        
+    # Detect specific clothing requests
+    clothing_keywords = ['wear', 'put on', 'dress in', 'change into']
+    if any(keyword in message_lower for keyword in clothing_keywords):
+        # Try to extract what they want to wear
+        for keyword in clothing_keywords:
+            if keyword in message_lower:
+                parts = message_lower.split(keyword)
+                if len(parts) > 1:
+                    clothing_desc = parts[1].strip().split('.')[0].split(',')[0]  # Take first part
+                    if len(clothing_desc) > 3:  # Basic validation
+                        app_state.current_clothing_state = "custom"
+                        app_state.current_clothing_description = clothing_desc
+                        print(f"[Clothing State] Changed to: custom ({clothing_desc})")
+                        return
+
+def detect_clothing_change_from_prompt(image_prompt):
+    """Detect clothing state changes from Mistral's image prompt and update state"""
+    if not image_prompt:
+        return
+        
+    prompt_lower = image_prompt.lower()
+    
+    # Check for nudity in the prompt
+    if any(keyword in prompt_lower for keyword in ['naked', 'nude', 'explicit nudity', 'without clothes']):
+        if app_state.current_clothing_state != "nude":
+            app_state.current_clothing_state = "nude"
+            app_state.current_clothing_description = None
+            print(f"[Clothing State] Detected from prompt: {app_state.current_clothing_state}")
+    
+    # Check for partial nudity
+    elif any(keyword in prompt_lower for keyword in ['topless', 'bare chest', 'exposed breasts']):
+        if app_state.current_clothing_state != "topless":
+            app_state.current_clothing_state = "topless"
+            app_state.current_clothing_description = None
+            print(f"[Clothing State] Detected from prompt: {app_state.current_clothing_state}")
+            
+    elif any(keyword in prompt_lower for keyword in ['bottomless', 'naked lower body']):
+        if app_state.current_clothing_state != "bottomless":
+            app_state.current_clothing_state = "bottomless"
+            app_state.current_clothing_description = None
+            print(f"[Clothing State] Detected from prompt: {app_state.current_clothing_state}")
+
+def ensure_character_consistency_in_prompt(image_prompt):
+    """Ensure image prompt includes character's physical description and appropriate clothing based on current state"""
+    if not image_prompt or not app_state.physical_description:
+        return image_prompt
+        
+    prompt_lower = image_prompt.lower()
+    
+    # Check if the prompt already includes detailed character description
+    has_physical_desc = any(keyword in prompt_lower for keyword in ['woman', 'man', 'person', 'character', 'hair', 'eyes', 'skin'])
+    
+    # If prompt is very generic or doesn't describe the character, enhance it
+    if not has_physical_desc or len(image_prompt.strip()) < 50:
+        char_desc_parts = [app_state.physical_description]
+        
+        # Add clothing based on current clothing state
+        clothing_already_specified = any(keyword in prompt_lower for keyword in ['naked', 'nude', 'topless', 'bottomless', 'wearing', 'dress', 'shirt', 'clothes'])
+        
+        if not clothing_already_specified:
+            if app_state.current_clothing_state == "dressed":
+                if app_state.initial_attire and app_state.initial_attire.strip():
+                    char_desc_parts.append(f"wearing {app_state.initial_attire}")
+            elif app_state.current_clothing_state == "custom" and app_state.current_clothing_description:
+                char_desc_parts.append(f"wearing {app_state.current_clothing_description}")
+            elif app_state.current_clothing_state == "nude":
+                char_desc_parts.append("naked, nude")
+            elif app_state.current_clothing_state == "topless":
+                char_desc_parts.append("topless, bare chest")
+            elif app_state.current_clothing_state == "bottomless":
+                char_desc_parts.append("bottomless, naked lower body")
+            
+        complete_desc = ", ".join(char_desc_parts)
+        # Prepend character description to the prompt
+        return f"{complete_desc}, {image_prompt}"
+    
+    return image_prompt
 
 # =====================
 # FastAPI Endpoints
@@ -2148,11 +2270,18 @@ async def chat(chat_message: ChatMessage):
     print(f"  source_img available: {app_state.source_img is not None}")
     print(f"  source_face available: {app_state.source_face is not None}")
 
+    # Detect clothing changes from user message before generating response
+    detect_clothing_change_from_message(message)
+    
     # Generate a response. If the message requests an image, add a brief hint so the LLM returns IMAGE_PROMPT.
     msg_for_mistral = ("[GENERATE_IMAGE] " + message) if message_requests_image(message) else message
     response_data = generate_mistral_response(msg_for_mistral)
     chat_response = response_data["chat_response"]
     image_prompt = response_data["image_prompt"]
+    
+    # Detect clothing changes from Mistral's image prompt as well
+    if image_prompt:
+        detect_clothing_change_from_prompt(image_prompt)
 
     # Store the assistant's response
     current_exchange["assistant"] = chat_response
@@ -2171,8 +2300,13 @@ async def chat(chat_message: ChatMessage):
     cleaned_image_prompt = cleaned_image_prompt.strip().lower()
     
     if is_first_chat and app_state.physical_description and cleaned_image_prompt and cleaned_image_prompt != "none":
-        print("Appending physical description to first image prompt")
-        image_prompt = f"{app_state.physical_description}, " + image_prompt
+        print("Appending physical description and initial attire to first image prompt")
+        # Build complete character description for first image
+        char_desc_parts = [app_state.physical_description]
+        if app_state.initial_attire and app_state.initial_attire.strip():
+            char_desc_parts.append(f"wearing {app_state.initial_attire}")
+        complete_char_desc = ", ".join(char_desc_parts)
+        image_prompt = f"{complete_char_desc}, " + image_prompt
     
 
 
@@ -2198,6 +2332,9 @@ async def chat(chat_message: ChatMessage):
                 # Add camera angle to the prompt if not already present
                 if camera_angle not in image_prompt.lower():
                     image_prompt += f", {camera_angle}"
+            
+            # Ensure the image prompt includes character consistency (physical desc + attire)
+            image_prompt = ensure_character_consistency_in_prompt(image_prompt)
                     
             print(f"[DEBUG] Attempting image generation with prompt: {image_prompt[:100]}...")
 
