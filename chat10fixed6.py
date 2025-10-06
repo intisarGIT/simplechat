@@ -47,7 +47,7 @@ from io import BytesIO
 from PIL import Image
 
 # Local Stable Diffusion support has been removed. Image generation uses ImageRouter
-# (remote) and Face++ for face merging. The diffusers/xformers imports and
+# (primary) with Pollinations API fallback, and Face++ for face merging. The diffusers/xformers imports and
 # related initialization have been intentionally removed to avoid heavy local
 # dependencies.
 
@@ -114,6 +114,8 @@ class AppState:
         self.mistral_api_key = os.getenv("MISTRAL_API_KEY", "")
         # Hugging Face token for private spaces (use HUGGINGFACE_TOKEN env var)
         self.huggingface_token = os.getenv("HUGGINGFACE_TOKEN", "")
+        # Pollinations API key for better rate limits (can be set via /set_api_settings or env POLLINATIONS_API_KEY)
+        self.pollinations_api_key = os.getenv("POLLINATIONS_API_KEY", "")
     
 
 
@@ -1125,7 +1127,7 @@ def generate_image(prompt, seed=None):
         print("Sending request to ImageRouter...")
         print(f"ImageRouter payload: {payload}")
         resp = requests.post(url, json=payload, headers=headers, timeout=60)
-        # If ImageRouter fails (rate limit 429 or other errors), fall back to AI Horde
+        # If ImageRouter fails (rate limit 429 or other errors), fall back to Pollinations API
         if resp.status_code != 200:
             print(f"ImageRouter returned status {resp.status_code}: {resp.text}")
             # Try to detect rate limit / daily limit message
@@ -1146,12 +1148,12 @@ def generate_image(prompt, seed=None):
                     is_rate_limit = True
 
             if is_rate_limit:
-                print("Detected ImageRouter rate limit — attempting AI Horde fallback")
-                aihorde_filename, aihorde_msg = generate_image_ai_horde(prompt, seed=seed)
-                if aihorde_filename:
-                    return aihorde_filename, f"AI Horde fallback: {aihorde_msg}"
+                print("Detected ImageRouter rate limit — attempting Pollinations API fallback")
+                pollinations_filename, pollinations_msg = generate_image_pollinations(prompt, seed=seed)
+                if pollinations_filename:
+                    return pollinations_filename, f"Pollinations API fallback: {pollinations_msg}"
                 else:
-                    return None, f"ImageRouter error {resp.status_code}: {resp.text} — AI Horde fallback failed: {aihorde_msg}"
+                    return None, f"ImageRouter error {resp.status_code}: {resp.text} — Pollinations API fallback failed: {pollinations_msg}"
 
             return None, f"ImageRouter error {resp.status_code}: {resp.text}"
 
@@ -1193,140 +1195,116 @@ def generate_image(prompt, seed=None):
         import traceback
         print(f"TRACEBACK: {traceback.format_exc()}")
         print("==================================")
-        # Attempt AI Horde fallback on unexpected exceptions as well
+        # Attempt Pollinations API fallback on unexpected exceptions as well
         try:
-            print("Attempting AI Horde fallback after exception")
-            aihorde_filename, aihorde_msg = generate_image_ai_horde(prompt, seed=seed)
-            if aihorde_filename:
-                return aihorde_filename, f"AI Horde fallback after exception: {aihorde_msg}"
+            print("Attempting Pollinations API fallback after exception")
+            pollinations_filename, pollinations_msg = generate_image_pollinations(prompt, seed=seed)
+            if pollinations_filename:
+                return pollinations_filename, f"Pollinations API fallback after exception: {pollinations_msg}"
             else:
-                return None, f"Error generating image: {str(e)}; AI Horde fallback failed: {aihorde_msg}"
+                return None, f"Error generating image: {str(e)}; Pollinations API fallback failed: {pollinations_msg}"
         except Exception as e2:
-            print(f"AI Horde fallback also failed: {e2}")
+            print(f"Pollinations API fallback also failed: {e2}")
             return None, f"Error generating image: {str(e)}"
 
 
-def generate_image_ai_horde(prompt, seed=None):
-    """Generate an image using AI Horde (Stable Horde) async API as a fallback.
+def generate_image_pollinations(prompt, seed=None):
+    """Generate an image using Pollinations API as a fallback.
 
     Returns (filename, message) on success or (None, error_message) on failure.
     """
     try:
-        print("\n==== AI HORDE FALLBACK STARTED =====")
+        import urllib.parse
+        
+        print("\n==== POLLINATIONS API FALLBACK STARTED =====")
         print(f"PROMPT: {prompt}")
-        print(f"SEED: {seed if seed is not None else 'None'}")
-        API_URL = "https://aihorde.net/api/v2/generate/async"
-        CHECK_URL = "https://aihorde.net/api/v2/generate/check"
-
-        api_key = os.getenv("AIHORDE_API_KEY", "")
-        headers = {"apikey": api_key} if api_key else {}
-
-        data = {
-            "prompt": prompt,
-            "models": ["juggernaut_xl"],  # AI Horde expects "models" array
-            "params": {
-                "width": 512,
-                "height": 768,
-                "steps": 30,
-                "cfg_scale": 7.5,
-                "sampler_name": "k_euler_a",
-                "clip_skip": 1,
-                "nsfw": True
-            }
+        print(f"SEED: {seed if seed is not None else 'random'}")
+        
+        # Get API key from app state or environment
+        api_key = app_state.pollinations_api_key or os.getenv("POLLINATIONS_API_KEY", "")
+        
+        # URL encode the prompt
+        encoded_prompt = urllib.parse.quote(prompt)
+        
+        # Build the API URL
+        base_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+        
+        # Set up parameters with your preferred values
+        params = {
+            "model": "turbo",
+            "width": 768,
+            "height": 1024,
+            "nologo": "true",  # Disable logo overlay
+            "private": "true", # Prevent from appearing in public feed
+            "enhance": "false", # Don't enhance the prompt
+            "safe": "false"    # Allow NSFW content
         }
         
-        # Add seed if provided
+        # Add seed if provided, otherwise let it be random
         if seed is not None:
-            data["params"]["seed"] = str(seed)
-
-        print("Sending request to AI Horde...")
-        resp = requests.post(API_URL, json=data, headers=headers, timeout=30)
-        if resp.status_code not in (200, 201, 202):
-            print(f"AI Horde returned status {resp.status_code}: {resp.text}")
-            return None, f"AI Horde start error {resp.status_code}: {resp.text}"
-
-        job = resp.json()
-        job_id = job.get("id") or job.get("job")
-        if not job_id:
-            print(f"AI Horde did not return job id: {job}")
-            return None, "AI Horde did not return job id"
-
-        print(f"AI Horde job started: {job_id}, polling for result...")
-
-        # Poll for completion
-        max_attempts = 120
-        attempt = 0
-        img_b64 = None
-        while attempt < max_attempts:
-            attempt += 1
-            try:
-                check_resp = requests.get(f"{CHECK_URL}/{job_id}", headers=headers, timeout=30)
-                if check_resp.status_code != 200:
-                    print(f"AI Horde check returned {check_resp.status_code}: {check_resp.text}")
-                    time.sleep(2)
-                    continue
-                chk = check_resp.json()
-                print(f"AI Horde status check {attempt}: done={chk.get('done')}, finished={chk.get('finished', 0)}, processing={chk.get('processing', 0)}, waiting={chk.get('waiting', 0)}")
-                
-                if chk.get("done"):
-                    gens = chk.get("generations") or []
-                    if isinstance(gens, list) and len(gens) > 0:
-                        first = gens[0]
-                        img_b64 = first.get("img") or first.get("base64") or first.get("b64")
-                        if img_b64:
-                            break
-                    print(f"Request done but no image found in generations: {gens}")
-                    return None, "AI Horde generation completed but no image returned"
-                
-                # Check for faulted/failed status
-                if chk.get("faulted"):
-                    return None, "AI Horde generation failed (faulted)"
-                    
-                # Not done yet, continue polling
-                time.sleep(2)
-            except Exception as e:
-                print(f"AI Horde poll error: {e}")
-                time.sleep(2)
-
-        if not img_b64:
-            print("AI Horde did not return an image within timeout or attempts")
-            return None, "AI Horde generation timed out or failed"
-
-        print(f"AI Horde returned image data (length: {len(img_b64) if isinstance(img_b64, str) else 'not string'})")
-
-        # img_b64 should be a base64 string
-        if isinstance(img_b64, str):
-            try:
-                # Handle data URLs like "data:image/webp;base64,..."
-                if img_b64.startswith("data:"):
-                    comma = img_b64.find(",")
-                    if comma != -1:
-                        img_b64 = img_b64[comma+1:]
-                image_bytes = base64.b64decode(img_b64)
-            except Exception as e:
-                print(f"Failed to decode base64 image: {e}")
-                return None, "AI Horde returned invalid base64 image data"
+            params["seed"] = str(seed)
+            
+        # Set up headers
+        headers = {}
+        if api_key:
+            # Add API key to headers for authenticated access
+            headers["Authorization"] = f"Bearer {api_key}"
+            print(f"Using Pollinations API key: {'*' * (len(api_key)-4) + api_key[-4:] if len(api_key) > 4 else 'Yes'}")
         else:
-            print("AI Horde returned non-string image data")
-            return None, "AI Horde returned unexpected image data format"
+            print("No Pollinations API key configured - using anonymous access (rate limited)")
+
+        print(f"Sending request to Pollinations API: {base_url}")
+        print(f"Parameters: {params}")
+        
+        # Make the request with a longer timeout for image generation
+        resp = requests.get(base_url, params=params, headers=headers, timeout=300)
+        
+        if resp.status_code != 200:
+            print(f"Pollinations API returned status {resp.status_code}")
+            # Check if we got text response with error details
+            try:
+                error_text = resp.text[:500] if resp.text else "No error details"
+                print(f"Error response: {error_text}")
+            except Exception:
+                pass
+            return None, f"Pollinations API error {resp.status_code}: {resp.text[:200] if resp.text else 'No details'}"
+
+        # Check if we got image data
+        if not resp.content:
+            print("Pollinations API returned empty response")
+            return None, "Pollinations API returned empty image"
+            
+        # Check content type to ensure we got an image
+        content_type = resp.headers.get('content-type', '').lower()
+        if not any(img_type in content_type for img_type in ['image/', 'jpeg', 'jpg', 'png', 'webp']):
+            print(f"Unexpected content type: {content_type}")
+            # If it's text, it might be an error message
+            if 'text' in content_type:
+                error_text = resp.text[:500] if resp.text else "Unknown error"
+                print(f"Text response (likely error): {error_text}")
+                return None, f"Pollinations API error: {error_text}"
+            return None, f"Unexpected content type: {content_type}"
 
         # Save image
-        output_filename = f"generated_aihorde_{uuid.uuid4()}.jpg"
+        output_filename = f"generated_pollinations_{uuid.uuid4()}.jpg"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
         with open(output_path, "wb") as f:
-            f.write(image_bytes)
+            f.write(resp.content)
 
         # Cache and set last prompt
         cache_key = f"{prompt}_{seed}" if seed is not None else prompt
         app_state.prompt_cache[cache_key] = output_filename
         app_state.last_used_prompt = prompt
-        print(f"AI Horde saved image to {output_path}")
-        return output_filename, "AI Horde image generated successfully"
+        
+        print(f"Pollinations API saved image to {output_path}")
+        print(f"Image size: {len(resp.content)} bytes")
+        return output_filename, "Pollinations API image generated successfully"
+        
     except Exception as e:
-        print(f"AI Horde fallback error: {e}")
+        print(f"Pollinations API fallback error: {e}")
         import traceback
         print(traceback.format_exc())
-        return None, f"AI Horde error: {str(e)}"
+        return None, f"Pollinations API error: {str(e)}"
 
 
 def generate_image_with_face_swap(response_text, seed=None):
@@ -1572,6 +1550,17 @@ def generate_mistral_response(message: str) -> dict:
     """Generate both a conversational response and an image prompt using Mistral API"""
     MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 
+    # Debug: Log all current character data to understand what's happening
+    print(f"[Character Debug] All current app_state values:")
+    print(f"  physical_description: '{app_state.physical_description}'")
+    print(f"  character_name: '{app_state.character_name}'")
+    print(f"  behavioral_description: '{app_state.behavioral_description}'")
+    print(f"  initial_attire: '{app_state.initial_attire}'")
+    print(f"  gender: '{app_state.gender}'")
+    print(f"  face_image_path: {app_state.face_image_path}")
+    print(f"  chat_history length: {len(app_state.chat_history) if app_state.chat_history else 0}")
+    print(f"  image_history length: {len(app_state.image_history) if hasattr(app_state, 'image_history') and app_state.image_history else 0}")
+
     # Update character state based on current message
     update_character_state(message)
 
@@ -1589,14 +1578,42 @@ def generate_mistral_response(message: str) -> dict:
     if (not app_state.physical_description or app_state.physical_description == "A unique and mysterious figure") and hasattr(app_state, 'image_history') and app_state.image_history:
         print("[Character Recovery] Attempting to recover character context from recent image prompts...")
         # Look for recent detailed image prompts that contain character descriptions
-        for entry in reversed(app_state.image_history[-3:]):  # Check last 3 image entries
+        for entry in reversed(app_state.image_history[-5:]):  # Check last 5 image entries
             prompt = entry.get('prompt', '')
             if prompt and len(prompt) > 50:
                 # This looks like a detailed character prompt, extract key info for context
-                print(f"[Character Recovery] Using recent image context: {prompt[:100]}...")
+                print(f"[Character Recovery] Found detailed prompt: {prompt[:100]}...")
+                
+                # First, check if we have stored character data in this entry
+                character_data = entry.get('character_data', {})
+                if character_data and character_data.get('physical_description'):
+                    print(f"[Character Recovery] Found stored character data!")
+                    app_state.physical_description = character_data.get('physical_description', '')
+                    app_state.character_name = character_data.get('character_name', '')
+                    app_state.behavioral_description = character_data.get('behavioral_description', '')
+                    app_state.initial_attire = character_data.get('initial_attire', '')
+                    app_state.gender = character_data.get('gender', 'Female')
+                    app_state.style = character_data.get('style', 'Photorealistic')
+                    if hasattr(app_state, 'current_clothing_state'):
+                        app_state.current_clothing_state = character_data.get('clothing_state', 'dressed')
+                    print(f"[Character Recovery] Restored: '{app_state.physical_description}', clothing: {character_data.get('clothing_state', 'dressed')}")
+                else:
+                    # Fallback: try to extract character description from the prompt
+                    desc_indicators = ["woman", "girl", "lady", "milf", "chubby", "slim", "tall", "short", 
+                                     "hair", "eyes", "skin", "Bengali", "Indian", "Asian", "European", 
+                                     "breasts", "figure", "body", "curvy", "petite"]
+                    
+                    if any(indicator in prompt.lower() for indicator in desc_indicators):
+                        print(f"[Character Recovery] Extracting character description from prompt...")
+                        # Use the prompt as character context but clean it up
+                        recovered_desc = prompt.split(',')[0:3]  # Take first few descriptive parts
+                        recovered_desc = ', '.join(recovered_desc).strip()
+                        if len(recovered_desc) > 20:
+                            app_state.physical_description = recovered_desc
+                            print(f"[Character Recovery] Recovered physical description: '{recovered_desc}'")
+                
                 # Add this as additional context to help Mistral maintain consistency
-                if not hasattr(app_state, 'recovered_character_context'):
-                    app_state.recovered_character_context = prompt
+                app_state.recovered_character_context = prompt
                 break
     
     char_name = app_state.character_name or "Fantasy Character"
@@ -1860,6 +1877,7 @@ def extract_camera_angle(user_message: str) -> Optional[str]:
 class ApiSettings(BaseModel):
     mistral_api_key: str
     imagerouter_api_key: Optional[str] = ""
+    pollinations_api_key: Optional[str] = ""
     facepp_api_key: Optional[str] = ""
     facepp_api_secret: Optional[str] = ""
     rapidapi_key: Optional[str] = ""
@@ -1878,6 +1896,9 @@ async def set_api_settings(settings: ApiSettings):
     # Store ImageRouter API key if provided
     if getattr(settings, 'imagerouter_api_key', None):
         app_state.imagerouter_api_key = settings.imagerouter_api_key
+    # Store Pollinations API key if provided
+    if getattr(settings, 'pollinations_api_key', None):
+        app_state.pollinations_api_key = settings.pollinations_api_key
     # Store Face++ API credentials if provided
     if getattr(settings, 'facepp_api_key', None):
         app_state.facepp_api_key = settings.facepp_api_key
@@ -2211,11 +2232,21 @@ async def chat(chat_message: ChatMessage):
         # Generate image using the dedicated image prompt
         image_path, image_message = generate_image_with_face_swap(image_prompt)
         if image_path:
-            # Add image to image history
+            # Add image to image history with character data for persistence
             image_entry = {
                 "path": image_path,
                 "prompt": image_prompt,
-                "timestamp": time.time()
+                "timestamp": time.time(),
+                # Store character data for recovery in case app_state is lost
+                "character_data": {
+                    "physical_description": app_state.physical_description,
+                    "character_name": app_state.character_name,
+                    "behavioral_description": app_state.behavioral_description,
+                    "initial_attire": app_state.initial_attire,
+                    "gender": app_state.gender,
+                    "style": app_state.style,
+                    "clothing_state": getattr(app_state, 'current_clothing_state', 'dressed')
+                }
             }
             app_state.image_history.append(image_entry)
 
