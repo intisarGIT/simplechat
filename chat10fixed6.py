@@ -77,12 +77,14 @@ class AppState:
         self.chat_context = ""
         self.chat_history = []
         self.image_history = []
-        self.sd_model_path = ""
-        # Fixed generation settings as requested
-        self.scheduler_type = "dpm_2m_karras"
-        self.guidance_scale = 7.0
-        self.num_inference_steps = 14
-        self.clip_skip = 2
+        
+        # Enhanced state tracking for memory consistency
+        self.current_clothing_state = "dressed"  # "dressed", "partial", "nude", "topless", "bottomless"
+        self.last_pose = ""  # Track last pose for consistency
+        self.location_context = ""  # Track current scene/location
+        self.recent_events = []  # Track recent important events (limit to last 5)
+        self.conversation_flow_summary = ""  # Summary of conversation progression
+        
         # Face swap components removed (we use Face++ remote merging)
         self.face_app = None
         self.face_swapper = None
@@ -1504,14 +1506,79 @@ def get_image_context(num_entries=3):
     return "\n".join(prompts)
 
 
+def update_character_state(user_message: str, image_prompt: str = None, chat_response: str = None):
+    """Update character state based on conversation content and image prompts"""
+    message_lower = user_message.lower()
+    
+    # Track clothing state changes
+    clothing_keywords = {
+        'nude': ['nude', 'naked', 'strip', 'undress', 'remove clothes', 'take off', 'without clothes', 'bare body', 'completely naked'],
+        'topless': ['topless', 'remove shirt', 'take off top', 'bare chest', 'without shirt', 'bare breasts'],
+        'bottomless': ['bottomless', 'remove pants', 'take off bottoms', 'without pants', 'bare lower'],
+        'dressed': ['dress up', 'put on clothes', 'get dressed', 'wear', 'clothed', 'wearing']
+    }
+    
+    # Update clothing state based on user request
+    for state, keywords in clothing_keywords.items():
+        if any(keyword in message_lower for keyword in keywords):
+            app_state.current_clothing_state = state
+            print(f"[State Update] Clothing state changed to: {state}")
+            break
+    
+    # Also track clothing state from generated image prompts to maintain consistency
+    if image_prompt and image_prompt != "none":
+        prompt_lower = image_prompt.lower()
+        if any(keyword in prompt_lower for keyword in ['nude', 'naked', 'bare body', 'explicit nudity']):
+            app_state.current_clothing_state = 'nude'
+            print(f"[State Update] Clothing state confirmed as nude from image prompt")
+        elif any(keyword in prompt_lower for keyword in ['topless', 'bare chest', 'bare breasts']):
+            app_state.current_clothing_state = 'topless'
+            print(f"[State Update] Clothing state confirmed as topless from image prompt")
+        elif any(keyword in prompt_lower for keyword in ['bottomless', 'bare lower']):
+            app_state.current_clothing_state = 'bottomless'
+            print(f"[State Update] Clothing state confirmed as bottomless from image prompt")
+    
+    # Track pose/position changes
+    pose_keywords = ['stand', 'sit', 'lie', 'kneel', 'pose', 'position', 'turn around', 'bend over']
+    for keyword in pose_keywords:
+        if keyword in message_lower:
+            app_state.last_pose = keyword
+            print(f"[State Update] Pose updated to: {keyword}")
+            break
+    
+    # Track location changes
+    location_keywords = ['bedroom', 'bathroom', 'kitchen', 'outside', 'garden', 'beach', 'forest']
+    for location in location_keywords:
+        if location in message_lower:
+            app_state.location_context = location
+            print(f"[State Update] Location updated to: {location}")
+            break
+    
+    # Add recent events to memory
+    if len(user_message.strip()) > 10:  # Only track substantial messages
+        event = f"User said: {user_message[:100]}"
+        app_state.recent_events.append(event)
+        # Keep only last 5 events to avoid bloat
+        if len(app_state.recent_events) > 5:
+            app_state.recent_events = app_state.recent_events[-5:]
+    
+    # Update conversation flow summary
+    if chat_response and len(chat_response) > 20:
+        flow_update = f"Character responded about: {chat_response[:50]}..."
+        app_state.conversation_flow_summary = flow_update
+
+
 def generate_mistral_response(message: str) -> dict:
     """Generate both a conversational response and an image prompt using Mistral API"""
     MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 
-    # Get context from chat history (last 5 exchanges)
+    # Update character state based on current message
+    update_character_state(message)
+
+    # Get context from chat history (expanded to last 10 exchanges for better memory)
     context = ""
     if len(app_state.chat_history) > 0:
-        context_messages = app_state.chat_history[-5:]
+        context_messages = app_state.chat_history[-10:]  # Increased from 5 to 10
         context = "\n".join([f"User: {msg['user']}\nAssistant: {msg.get('assistant', '')}"
                              for msg in context_messages if 'user' in msg])
     # Create the system message for roleplay
@@ -1553,12 +1620,21 @@ def generate_mistral_response(message: str) -> dict:
     - Gender: {gender}
     - Personality: {personality}
     
-    MEMORY & CONSISTENCY RULES:
+    CURRENT STATE TRACKING:
+    - Clothing state: {app_state.current_clothing_state}
+    - Last pose/position: {app_state.last_pose or 'not specified'}
+    - Current location: {app_state.location_context or 'not specified'}
+    - Recent events: {', '.join(app_state.recent_events[-3:]) if app_state.recent_events else 'none'}
+    
+    CRITICAL MEMORY & CONSISTENCY RULES:
     - ALWAYS maintain your character identity and appearance throughout the conversation
-    - Remember previous interactions and build on them naturally
-    - Your attire may change during the conversation based on context, but your core appearance stays consistent
-    - Stay in character and maintain the established relationship dynamic
-    - Reference previous events or images when relevant to show continuity
+    - Remember and reference previous interactions, events, and state changes
+    - CLOTHING CONTINUITY: If currently nude/undressed, stay nude unless explicitly asked to dress
+    - If currently dressed, only undress when specifically requested
+    - When changing poses or positions, maintain current clothing state unless told otherwise
+    - Your core physical appearance (hair, body, face) never changes, only clothing/poses
+    - Build naturally on the conversation flow and previous events
+    - Reference recent events and maintain emotional/relationship continuity
 
     When user asks for visual content ("show", "picture", "appearance", "strip", "let me see", "send", etc. or relevant words in any language), provide both parts:
     
@@ -1571,6 +1647,14 @@ def generate_mistral_response(message: str) -> dict:
     This should include visual details about yourself, the scene, lighting, and mood.
     Create a single flowing description without sections or bullet points.
 
+    CLOTHING STATE CONSISTENCY RULES:
+    - If current clothing state is 'nude': ALWAYS include "naked", "nude", "explicit nudity" unless user explicitly asks to dress
+    - If current clothing state is 'topless': Include "topless", "bare chest/breasts" 
+    - If current clothing state is 'bottomless': Include "bottomless", "naked lower body"
+    - If current clothing state is 'dressed': Include appropriate clothing descriptions
+    - When user asks to change pose but NOT clothing, maintain the current clothing state
+    - Only change clothing state when explicitly requested
+
     IMPORTANT FOR NSFW REQUESTS: When user asks to "strip", "undress", "naked", "nude", "bottomless", "topless", "remove clothes", "show body parts", or any explicit content, you MUST include explicit anatomical terms in the IMAGE_PROMPT:
     - For female characters: include "breasts", "nipples", "vagina", "pussy" as appropriate
     - For male characters: include "penis", "cock" as appropriate  
@@ -1579,7 +1663,7 @@ def generate_mistral_response(message: str) -> dict:
        
     The prompt should be concise (under 80 words) and focus on:
     - physical appearance details matching your character description
-    - specific clothing/attire (or lack thereof for NSFW)
+    - specific clothing/attire (or lack thereof) - MAINTAIN CURRENT STATE unless changing
     - facial expression and pose
     - precise location/setting
     - lighting conditions
@@ -1617,6 +1701,11 @@ def generate_mistral_response(message: str) -> dict:
     if hasattr(app_state, 'recovered_character_context') and app_state.recovered_character_context:
         messages.append({"role": "user",
                          "content": f"Previous character description for consistency: {app_state.recovered_character_context[:200]}..."})
+
+    # Add conversation flow summary for better continuity
+    if app_state.conversation_flow_summary:
+        messages.append({"role": "user",
+                         "content": f"Conversation context: {app_state.conversation_flow_summary}"})
 
     # Enhanced character reminder with explicit instructions
     char_consistency_reminder = f"""CHARACTER CONSISTENCY REMINDER:
@@ -1722,6 +1811,9 @@ def generate_mistral_response(message: str) -> dict:
                     if len(pick) < 200 and len(pick) > 15:
                         image_prompt = pick
 
+            # Update character state with the response
+            update_character_state(message, image_prompt, chat_response)
+            
             return {
                 "chat_response": chat_response,
                 "image_prompt": "none" if (not image_prompt or image_prompt.lower().strip() == "none") else image_prompt
