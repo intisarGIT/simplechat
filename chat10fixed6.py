@@ -1590,6 +1590,12 @@ def generate_mistral_response(message: str) -> dict:
     print(f"[Character Debug] Current character: {app_state.character_name or 'None'}")
     print(f"[Character Debug] Physical description: {app_state.physical_description[:50] if app_state.physical_description else 'None'}...")
     print(f"[Character Debug] Messages in conversation: {len(app_state.conversation_messages)}")
+    print(f"[Character Debug] Face image path: {getattr(app_state, 'face_image_path', 'None')}")
+    print(f"[Character Debug] Source img available: {app_state.source_img is not None}")
+    
+    # Quick check for essential character data
+    has_core_data = bool(app_state.character_name and app_state.physical_description)
+    print(f"[Character Debug] Core character data complete: {has_core_data}")
 
     # Build character info simply (like app.py)
     char_name = app_state.character_name or "Fantasy Character"
@@ -1600,31 +1606,53 @@ def generate_mistral_response(message: str) -> dict:
     gender = app_state.gender or "Female"
     style = app_state.style or "Photorealistic"
     
+    # Character consistency check and recovery
+    if (not app_state.character_name or not app_state.physical_description) and hasattr(app_state, 'image_history') and app_state.image_history:
+        print("[Character Recovery] Attempting to recover lost character data...")
+        latest_image = app_state.image_history[-1]
+        if 'character_data' in latest_image:
+            char_data = latest_image['character_data']
+            # Restore all character attributes that are missing
+            if not app_state.character_name and char_data.get('character_name'):
+                char_name = char_data['character_name']
+                app_state.character_name = char_name
+                print(f"[Character Recovery] Recovered character name: {char_name}")
+            if not app_state.physical_description and char_data.get('physical_description'):
+                appearance = char_data['physical_description']
+                app_state.physical_description = appearance
+                print(f"[Character Recovery] Recovered physical description: {appearance[:50]}...")
+            if not app_state.behavioral_description and char_data.get('behavioral_description'):
+                personality = char_data['behavioral_description']
+                app_state.behavioral_description = personality
+                print(f"[Character Recovery] Recovered personality")
+            if not app_state.relation_to_user and char_data.get('relation_to_user'):
+                app_state.relation_to_user = char_data['relation_to_user']
+            if not app_state.user_name and char_data.get('user_name'):
+                app_state.user_name = char_data['user_name']
+    
     print(f"[Character Info] Using: {char_name} - {appearance[:30]}...")
+    print(f"[Memory Management] Total messages in history: {len(app_state.conversation_messages)}")
+    print(f"[Memory Management] System message length: {len(system_message)} chars")
 
 
-    # Create character directive like app.py
-    character_parts = []
-    if char_name and char_name != "Fantasy Character":
-        character_parts.append(f"Character name: {char_name}.")
-    if relation:
-        character_parts.append(f"Relation to the user: {relation}.")
+    # Create persistent character directive with all key details
+    character_parts = [
+        f"You are {char_name}, a {gender.lower()} character.",
+        f"Physical appearance: {appearance}",
+        f"Personality and behavior: {personality}",
+        f"Typical clothing: {attire}",
+        f"Your relationship to the user: {relation}"
+    ]
+    
+    # Add user name if specified
     if app_state.user_name:
-        character_parts.append(f"This character should call the user: {app_state.user_name}.")
-    if appearance and appearance != "A unique and mysterious figure":
-        character_parts.append(f"Physical appearance: {appearance}.")
-    if personality:
-        character_parts.append(f"Personality: {personality}.")
-    if attire and attire != "appropriate clothing":
-        character_parts.append(f"Typical attire: {attire}.")
-    if gender and gender != "Female":
-        character_parts.append(f"Gender: {gender}.")
+        character_parts.append(f"Always address the user as: {app_state.user_name}")
+    
+    # Add style preference for images
     if style and style != "Photorealistic":
-        character_parts.append(f"Art style: {style}.")
+        character_parts.append(f"Visual style for images: {style}")
     
-    character_directive = " ".join(character_parts) if character_parts else ""
-    
-    # Simple system message like app.py but adapted for our use case
+    character_directive = " ".join(character_parts)    # Simple system message like app.py but adapted for our use case
     base_system = """You are a naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
     Don't come off as too strong at the very beginning, only be naughty if initiated by the user.
     If the user speaks in Bengali, continue the conversation in Bengali. Do not provide translations or explanations.
@@ -1673,9 +1701,15 @@ def generate_mistral_response(message: str) -> dict:
 
     Only generate an IMAGE_PROMPT when the conversation calls for showing an image. If no image is needed, respond with "IMAGE_PROMPT: none".
 
-    Stay in character as {char_name}."""
+    Stay in character as {char_name}.
+    
+    IMPORTANT: Your character identity, appearance, personality, and relationship to the user remain CONSTANT throughout the entire conversation. Never forget who you are or change your fundamental characteristics."""
 
-    system_message = f"{character_directive} {base_system}" if character_directive else base_system
+    # Combine character info with system message
+    if character_directive:
+        system_message = f"CHARACTER IDENTITY: {character_directive}\n\n{base_system}"
+    else:
+        system_message = base_system
     
     print(f"[System Message] Generated system message for {char_name}")
     
@@ -1685,10 +1719,30 @@ def generate_mistral_response(message: str) -> dict:
     # Create messages array similar to app.py
     messages = [{"role": "system", "content": system_message}]
     
-    # Add conversation history (like app.py) - keep last 20 messages for context
+    # Add conversation history - keep only last 5 user-assistant pairs for efficiency
     if app_state.conversation_messages:
-        recent_messages = app_state.conversation_messages[-20:]
-        messages.extend(recent_messages)
+        # Extract last 5 complete interactions (user + assistant pairs)
+        recent_pairs = []
+        temp_messages = app_state.conversation_messages[-20:]  # Look at last 20 messages max
+        
+        # Group messages into user-assistant pairs
+        i = 0
+        pair_count = 0
+        while i < len(temp_messages) and pair_count < 5:
+            if temp_messages[i].get("role") == "user":
+                # Found a user message, look for corresponding assistant message
+                recent_pairs.append(temp_messages[i])
+                if i + 1 < len(temp_messages) and temp_messages[i + 1].get("role") == "assistant":
+                    recent_pairs.append(temp_messages[i + 1])
+                    i += 2
+                else:
+                    i += 1
+                pair_count += 1
+            else:
+                i += 1
+        
+        messages.extend(recent_pairs)
+        print(f"[Context Management] Using {len(recent_pairs)} messages from last {pair_count} interactions")
     
     # Add current user message
     messages.append(user_message)
@@ -1771,19 +1825,21 @@ def generate_mistral_response(message: str) -> dict:
                     if len(pick) < 200 and len(pick) > 15:
                         image_prompt = pick
 
+            # Add user message first if not already added
+            if not app_state.conversation_messages or app_state.conversation_messages[-1].get("role") != "user":
+                app_state.conversation_messages.append(user_message)
+            
             # Add assistant response to conversation history (like app.py)
             assistant_message = {"role": "assistant", "content": full_response}
             app_state.conversation_messages.append(assistant_message)
             
-            # Keep conversation history reasonable (last 50 messages)
-            if len(app_state.conversation_messages) > 50:
-                app_state.conversation_messages = app_state.conversation_messages[-50:]
+            # Keep conversation history lean (last 20 messages = ~10 interactions)
+            if len(app_state.conversation_messages) > 20:
+                app_state.conversation_messages = app_state.conversation_messages[-20:]
             
-            # Also save to the old chat_history format for compatibility
-            app_state.chat_history.append({
-                "user": message,
-                "assistant": chat_response
-            })
+            # Update the current chat exchange with assistant response
+            if app_state.chat_history:
+                app_state.chat_history[-1]["assistant"] = chat_response
             
             print(f"[Conversation] Total messages in history: {len(app_state.conversation_messages)}")
             
@@ -2148,11 +2204,18 @@ async def chat(chat_message: ChatMessage):
     current_exchange = {"user": message}
     app_state.chat_history.append(current_exchange)
 
-    # Periodic check to ensure face data hasn't been lost during session
-    print(f"[SESSION CHECK] Chat #{len(app_state.chat_history)} - Face data status before generation:")
+    # Periodic check to ensure face data and character state haven't been lost during session
+    print(f"[SESSION CHECK] Chat #{len(app_state.chat_history)} - State status before generation:")
     print(f"  face_image_path: {bool(app_state.face_image_path)}")
     print(f"  source_img available: {app_state.source_img is not None}")
     print(f"  source_face available: {app_state.source_face is not None}")
+    print(f"  character_name: {bool(app_state.character_name)}")
+    print(f"  physical_description: {bool(app_state.physical_description)}")
+    
+    # Auto-recover face data if path exists but source_img is missing
+    if app_state.face_image_path and app_state.source_img is None:
+        print("[SESSION RECOVERY] Face path exists but source_img missing, attempting reload...")
+        ensure_face_data_loaded()
 
     # Generate a response. If the message requests an image, add a brief hint so the LLM returns IMAGE_PROMPT.
     msg_for_mistral = ("[GENERATE_IMAGE] " + message) if message_requests_image(message) else message
@@ -2227,6 +2290,8 @@ async def chat(chat_message: ChatMessage):
                             "initial_attire": app_state.initial_attire,
                             "gender": app_state.gender,
                             "style": app_state.style,
+                            "relation_to_user": app_state.relation_to_user,
+                            "user_name": app_state.user_name,
                             "clothing_state": getattr(app_state, 'current_clothing_state', 'dressed')
                         }
                     }
