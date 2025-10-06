@@ -1043,6 +1043,43 @@ def detect_face_gender(face):
         return "unknown"
 
 
+def ensure_face_data_loaded():
+    """Ensure face data is loaded into app_state if a face image is available"""
+    try:
+        print(f"[FACE DATA CHECK] face_image_path: {app_state.face_image_path}")
+        print(f"[FACE DATA CHECK] source_img available: {app_state.source_img is not None}")
+        print(f"[FACE DATA CHECK] source_face available: {app_state.source_face is not None}")
+        
+        # If we have a face image path but no source_img, load it
+        if app_state.face_image_path and app_state.source_img is None:
+            print(f"[FACE DATA LOAD] Loading face data from {app_state.face_image_path}")
+            if os.path.exists(app_state.face_image_path):
+                extracted_face, source_img = extract_face_from_image(app_state.face_image_path)
+                if source_img is not None:
+                    app_state.source_img = source_img
+                    app_state.source_face = None  # We use source_img for face swapping
+                    print(f"[FACE DATA LOAD] Successfully loaded face data")
+                    return True
+                else:
+                    print(f"[FACE DATA LOAD] Failed to extract face from image")
+            else:
+                print(f"[FACE DATA LOAD] Face image file not found at {app_state.face_image_path}")
+        
+        # If we already have source_img, we're good
+        if app_state.source_img is not None:
+            print(f"[FACE DATA CHECK] Face data already available")
+            return True
+            
+        print(f"[FACE DATA CHECK] No face data available")
+        return False
+        
+    except Exception as e:
+        print(f"[FACE DATA ERROR] Error ensuring face data loaded: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return False
+
+
 # =====================
 # Image Generation
 # =====================
@@ -1327,13 +1364,15 @@ def generate_image_with_face_swap(response_text, seed=None):
             print("=============================")
             return None, "Image prompt was 'none' — skipping image generation"
 
+        # Ensure face data is loaded before determining if we can do face swap
+        face_data_available = ensure_face_data_loaded()
+        
         # If no character face was uploaded, we will still generate a base image
         # from the prompt and skip the face-swap step. This ensures images are
         # produced even if the user hasn't uploaded a face yet.
-        do_face_swap = True
-        if not app_state.face_image_path and not app_state.source_img:
-            print("No uploaded character face found — will generate base image without face swap")
-            do_face_swap = False
+        do_face_swap = face_data_available
+        if not face_data_available:
+            print("No character face data available — will generate base image without face swap")
             
         # For the first image in chat, use the saved character seed if available and no specific seed was provided
         if seed is None and len(app_state.chat_history) <= 1 and app_state.character_seed is not None:
@@ -1387,13 +1426,25 @@ def generate_image_with_face_swap(response_text, seed=None):
         print("\n==== EXECUTING FACE SWAP =====")
         print(f"SOURCE FACE: {'Available' if app_state.source_face is not None else 'Missing'}")
         print(f"SOURCE IMAGE: {'Available' if app_state.source_img is not None else 'Missing'}")
+        if app_state.source_img is not None:
+            print(f"SOURCE IMAGE SHAPE: {getattr(app_state.source_img, 'shape', 'No shape attr')}")
+        print(f"FACE IMAGE PATH: {getattr(app_state, 'face_image_path', 'None')}")
+        print(f"DO_FACE_SWAP: {do_face_swap}")
         print(f"TARGET IMAGE: {generated_path}")
         print(f"OUTPUT PATH: {swapped_path}")
         
         result_path = None
         if do_face_swap:
-            # Perform face swapping
-            result_path = swap_face(app_state.source_face, app_state.source_img, generated_path, swapped_path)
+            # Double-check face data is still available before swapping
+            if app_state.source_img is None:
+                print("[WARNING] Face data lost during process, attempting to reload...")
+                if not ensure_face_data_loaded():
+                    print("[WARNING] Could not reload face data, skipping face swap")
+                    do_face_swap = False
+            
+            if do_face_swap:
+                # Perform face swapping
+                result_path = swap_face(app_state.source_face, app_state.source_img, generated_path, swapped_path)
 
             if not result_path:
                 print("FACE SWAP RESULT: Failed")
@@ -1981,6 +2032,7 @@ async def upload_character(
         app_state.source_face = None
         app_state.source_img = source_img
         app_state.face_image_path = file_location
+        print(f"[FACE UPLOAD] Successfully stored face data - source_img shape: {source_img.shape if source_img is not None else 'None'}")
         print(f"[DEBUG] Setting physical_description in setup_character: '{physical_description}'")
         app_state.physical_description = physical_description
         app_state.behavioral_description = behavioral_description
@@ -2191,6 +2243,12 @@ async def chat(chat_message: ChatMessage):
     current_exchange = {"user": message}
     app_state.chat_history.append(current_exchange)
 
+    # Periodic check to ensure face data hasn't been lost during session
+    print(f"[SESSION CHECK] Chat #{len(app_state.chat_history)} - Face data status before generation:")
+    print(f"  face_image_path: {bool(app_state.face_image_path)}")
+    print(f"  source_img available: {app_state.source_img is not None}")
+    print(f"  source_face available: {app_state.source_face is not None}")
+
     # Generate a response. If the message requests an image, add a brief hint so the LLM returns IMAGE_PROMPT.
     msg_for_mistral = ("[GENERATE_IMAGE] " + message) if message_requests_image(message) else message
     response_data = generate_mistral_response(msg_for_mistral)
@@ -2219,7 +2277,13 @@ async def chat(chat_message: ChatMessage):
     
 
 
-    if cleaned_image_prompt and cleaned_image_prompt != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
+    if cleaned_image_prompt and cleaned_image_prompt != "none":
+        print(f"[DEBUG] Image generation check - prompt: '{cleaned_image_prompt}', face_image_path: {getattr(app_state, 'face_image_path', None)}, source_img available: {getattr(app_state, 'source_img', None) is not None}")
+        
+        # Ensure face data is loaded if available (for consistent face swapping)
+        face_data_status = ensure_face_data_loaded()
+        print(f"[DEBUG] Face data status: {face_data_status}")
+        
         # Extract camera angle from user message if present
         camera_angle = extract_camera_angle(message)
         if camera_angle:
@@ -2227,35 +2291,65 @@ async def chat(chat_message: ChatMessage):
             if camera_angle not in image_prompt.lower():
                 image_prompt += f", {camera_angle}"
                 
+        print(f"[DEBUG] Attempting image generation with prompt: {image_prompt[:100]}...")
 
-
-        # Generate image using the dedicated image prompt
-        image_path, image_message = generate_image_with_face_swap(image_prompt)
-        if image_path:
-            # Add image to image history with character data for persistence
-            image_entry = {
-                "path": image_path,
-                "prompt": image_prompt,
-                "timestamp": time.time(),
-                # Store character data for recovery in case app_state is lost
-                "character_data": {
-                    "physical_description": app_state.physical_description,
-                    "character_name": app_state.character_name,
-                    "behavioral_description": app_state.behavioral_description,
-                    "initial_attire": app_state.initial_attire,
-                    "gender": app_state.gender,
-                    "style": app_state.style,
-                    "clothing_state": getattr(app_state, 'current_clothing_state', 'dressed')
+        # Generate image using the dedicated image prompt (works with or without face data)
+        try:
+            image_path, image_message = generate_image_with_face_swap(image_prompt)
+            print(f"[DEBUG] Image generation result - path: {image_path}, message: {image_message}")
+            
+            if image_path:
+                # Add image to image history with character data for persistence
+                image_entry = {
+                    "path": image_path,
+                    "prompt": image_prompt,
+                    "timestamp": time.time(),
+                    # Store character data for recovery in case app_state is lost
+                    "character_data": {
+                        "physical_description": app_state.physical_description,
+                        "character_name": app_state.character_name,
+                        "behavioral_description": app_state.behavioral_description,
+                        "initial_attire": app_state.initial_attire,
+                        "gender": app_state.gender,
+                        "style": app_state.style,
+                        "clothing_state": getattr(app_state, 'current_clothing_state', 'dressed')
+                    }
                 }
-            }
-            app_state.image_history.append(image_entry)
+                app_state.image_history.append(image_entry)
 
-            # Construct full path to the image
-            full_image_path = os.path.join(OUTPUT_DIR, image_path)
-            # Read and encode the image as base64
-            with open(full_image_path, "rb") as image_file:
-                image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                # Construct full path to the image
+                full_image_path = os.path.join(OUTPUT_DIR, image_path)
+                print(f"[DEBUG] Reading image from: {full_image_path}")
+                
+                # Check if file exists before trying to read (with retry for timing issues)
+                if os.path.exists(full_image_path):
+                    # Read and encode the image as base64
+                    with open(full_image_path, "rb") as image_file:
+                        image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                    print(f"[DEBUG] Successfully encoded image data ({len(image_data)} characters)")
+                else:
+                    # Sometimes there can be a small delay in file system operations
+                    print(f"[DEBUG] Image file not immediately found, waiting 1 second...")
+                    import time
+                    time.sleep(1)
+                    if os.path.exists(full_image_path):
+                        with open(full_image_path, "rb") as image_file:
+                            image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                        print(f"[DEBUG] Successfully encoded image data after retry ({len(image_data)} characters)")
+                    else:
+                        print(f"[ERROR] Image file not found at {full_image_path} even after retry")
+                        image_message = f"Image generated but file not found: {image_path}"
+            else:
+                print(f"[DEBUG] No image generated - {image_message}")
+        except Exception as e:
+            print(f"[ERROR] Exception during image generation: {e}")
+            import traceback
+            print(traceback.format_exc())
+            image_message = f"Image generation failed: {str(e)}"
 
+    # Final debug logging before return
+    print(f"[DEBUG] Final response - chat_response: {len(chat_response) if chat_response else 0} chars, image_data: {len(image_data) if image_data else 0} chars, image_message: {image_message}")
+    
     return JSONResponse(
         content={
             "response": chat_response,
