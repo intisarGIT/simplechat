@@ -84,7 +84,6 @@ class AppState:
         self.source_img = None
         self.sd_pipe = None
         self.prompt_cache = {}  # Cache for prompt->image mapping
-        self.force_clothed = True  # Default: keep character fully clothed
         self.last_used_prompt = None
         # New character attributes
         self.initial_attire = ""
@@ -107,82 +106,7 @@ class AppState:
         self.mistral_api_key = os.getenv("MISTRAL_API_KEY", "")
     
 
-    def apply_nsfw_filter(self, prompt_text, character_desc=""):
-        """
-        Centralized function to apply NSFW filtering to prompts
-        Returns the filtered prompt and a boolean indicating if filtering was applied
-        """
-        clothing_terms = ["clothed", "jacket", "robe", "uniform", "dress", "outfit", "shirt", "pants", "skirt", "blouse"]
-        nsfw_terms = {
-            "breast": "chest", 
-            "breasts": "chest",
-            "boob": "chest", 
-            "boobs": "chest",
-            "saggy": "natural",
-            "areola": "chest",
-            "nipple": "chest",
-            "nipples": "chest",
-            "ass": "figure", 
-            "butt": "figure", 
-            "naked": "clothed", 
-            "nude": "clothed", 
-            "revealing": "modest", 
-            "cleavage": "neckline", 
-            "underwear": "clothing", 
-            "lingerie": "clothing",
-            "busty": "curvy",
-            "voluptuous": "curvy"
-        }
-        
-        # Check if filtering is enabled - if not, return original prompt
-        if not self.force_clothed:
-            print("NSFW filter is disabled - allowing explicit content in prompt")
-            return prompt_text, False
-            
-        needs_clothing = True  # Since force_clothed is True, we need clothing
-        filtering_applied = False
 
-        # NSFW detected in physical description
-        if character_desc and any(term in character_desc.lower() for term in nsfw_terms):
-            needs_clothing = True
-        
-        # Apply regex pattern matching for compound NSFW phrases
-        nsfw_patterns = [
-            (r'\b(huge|large|big|saggy|perky)\s+(breast|breasts|boob|boobs)\b', 'curvy figure'),
-            (r'\b(dark|pink|large)\s+(areola|nipple|nipples)\b', 'chest'),
-            (r'\b(revealing|low-cut|tight)\s+(outfit|dress|top|clothing)\b', 'modest outfit'),
-            (r'\b(sexy|seductive|provocative)\s+(pose|look|appearance)\b', 'natural pose')
-        ]
-        
-        # First apply word-by-word replacement
-        prompt_lower = prompt_text.lower()
-        for nsfw_term, replacement in nsfw_terms.items():
-            # Only replace if the term exists and isn't part of another word
-            if nsfw_term in prompt_lower:
-                # Use regex to replace the term as a whole word
-                prompt_text = re.sub(r'\b' + nsfw_term + r'\b', replacement, prompt_text, flags=re.IGNORECASE)
-                filtering_applied = True
-        
-        # Then apply pattern matching for compound phrases
-        for pattern, replacement in nsfw_patterns:
-            if re.search(pattern, prompt_text, re.IGNORECASE):
-                prompt_text = re.sub(pattern, replacement, prompt_text, flags=re.IGNORECASE)
-                filtering_applied = True
-        
-        # Only add generic clothing tag if no specific clothing or colors are already present
-        color_keywords = ["red", "blue", "green", "yellow", "orange", "pink", "purple", "brown", "black", "white", "gray", "grey", "teal", "cyan"]
-        has_color = any(c in prompt_text.lower() for c in color_keywords)
-        has_clothing = any(term in prompt_text.lower() for term in clothing_terms)
-
-        if not has_color and not has_clothing:
-            prompt_text = "fully clothed, wearing modest outfit, " + prompt_text
-            print("Applied clothing protection to prompt")
-            filtering_applied = True
-        else:
-            print("Color or clothing terms already present — skipping generic clothing prepend")
-
-        
-        return prompt_text, filtering_applied
 
     # initialize_face_models removed — no local face model initialization needed
 
@@ -205,78 +129,9 @@ class AppState:
 app_state = AppState()
 
 
-def evaluate_nsfw_toggle(msg: str):
-    """Evaluate msg and update app_state.force_clothed.
-
-    Returns a short reason string describing what occurred.
-    """
-    # Use whole-word regex matching to avoid substring false positives.
-    text = (msg or "").lower()
-    tokens = len(text.split())
-
-    # Explicit command patterns — these should always take precedence
-    # explicit_disable = patterns that DISABLE the filter (allow NSFW content)
-    # explicit_enable = patterns that ENABLE the filter (block NSFW content) 
-    explicit_disable = [r"\bdisable filter\b", r"\bturn off filter\b", r"\bno filter\b", r"\benable nsfw\b", r"\ballow nsfw\b"]
-    explicit_enable = [r"\benable filter\b", r"\bturn on filter\b", r"\bactivate filter\b", r"\bdisable nsfw\b"]
-
-    # Debug: log incoming message
-    print(f"[nsfw-toggle] evaluating message: {msg!r}")
-    for pat in explicit_disable:
-        if re.search(pat, text):
-            app_state.force_clothed = False
-            print(f"[nsfw-toggle] matched explicit disable pattern: {pat} - NSFW ENABLED")
-            return "disabled by explicit user command"
-    for pat in explicit_enable:
-        if re.search(pat, text):
-            app_state.force_clothed = True
-            print(f"[nsfw-toggle] matched explicit enable pattern: {pat} - NSFW DISABLED")
-            return "enabled by explicit user command"
-
-    # Natural language triggers (allow nudity unless negated nearby)
-    natural_triggers = [r"\bstrip\b", r"\bundress\b", r"\btake off\b", r"\bremove clothes\b", r"\bno panties\b",
-                        r"\bbottomless\b", r"\bnaked\b", r"\bnude\b", r"\bbare\b", r"\bexpose\b", r"\bremove.*clothing\b", 
-                        r"\bremove.*shirt\b", r"\bremove.*dress\b", r"\bremove.*top\b", r"\btopless\b", r"\bno bra\b",
-                        r"\bshow me naked\b", r"\bshow.*nude\b", r"\bshow.*topless\b", r"\bwithout.*clothes\b", 
-                        r"\bwithout.*shirt\b", r"\bwithout.*top\b", r"\buncover\b", r"\bexposed\b"]
-    # Be more specific with restore phrases to avoid accidental matches
-    restore_phrases = [r"\bget dressed\b", r"\bput.*clothes\b", r"\bdress up\b", r"\bcover.*up\b", r"\bwear.*clothes\b"]
-
-    # Check for natural language triggers (simplified - no negation detection)
-    trigger_found = False
-    for pat in natural_triggers:
-        match = re.search(pat, text)
-        if match:
-            matched_text = match.group()
-            print(f"[nsfw-toggle] found trigger: '{matched_text}' from pattern: {pat}")
-            trigger_found = True
-            break
-
-    if trigger_found:
-        app_state.force_clothed = False
-        print(f"[nsfw-toggle] matched natural-language trigger (no nearby negation) - NSFW ENABLED")
-        return "disabled by natural-language trigger"
-
-    # Restore clothing if user explicitly requests covered/modest or asks to re-enable filter
-    for pat in restore_phrases:
-        if re.search(pat, text):
-            app_state.force_clothed = True
-            print(f"[nsfw-toggle] matched restore phrase: {pat} - NSFW DISABLED")
-            return "enabled by natural-language restore phrase"
-
-    # Fallback heuristic for short messages: if message is short and contains a trigger word
-    short_triggers = [r"\bnsfw\b", r"\bx{3,}\b", r"\bporn\b"]
-    if tokens <= 12 and (any(re.search(p, text) for p in short_triggers) or any(re.search(p, text) for p in natural_triggers)):
-        app_state.force_clothed = False
-        print(f"[nsfw-toggle] disabled by short message heuristic (tokens={tokens})")
-        return "disabled by short NSFW trigger"
-
-    print(f"[nsfw-toggle] no patterns matched, state unchanged: force_clothed={app_state.force_clothed}")
-    return "unchanged"
-
 
 def message_requests_image(msg: str) -> bool:
-    """Return True if the user's message contains clear visual/image requests or NSFW triggers."""
+    """Return True if the user's message contains clear visual/image requests."""
     m = msg.lower()
     triggers = [
         "show", "show me", "picture", "look like", "appearance", "see me", "imagine", "visualize",
@@ -1280,19 +1135,8 @@ def generate_image(prompt, seed=None):
         print(f"SEED VALUE: {seed if seed is not None else 'None (random)'}")
         print("====================================")
 
-        # Apply NSFW filtering to the prompt
-        filtered_prompt, filtering_applied = app_state.apply_nsfw_filter(prompt, app_state.physical_description)
-        print("\n==== NSFW FILTERING STAGE =====")
-        if filtering_applied:
-            print(f"NSFW FILTERING APPLIED: Yes")
-            print(f"ORIGINAL PROMPT: {prompt}")
-            print(f"FILTERED PROMPT: {filtered_prompt}")
-        else:
-            print("NSFW FILTERING APPLIED: No")
-        print("=================================")
-
         # Check cache (use prompt+seed as key)
-        cache_key = f"{filtered_prompt}_{seed}" if seed is not None else filtered_prompt
+        cache_key = f"{prompt}_{seed}" if seed is not None else prompt
         if cache_key in app_state.prompt_cache:
             cached = app_state.prompt_cache[cache_key]
             cached_path = os.path.join(OUTPUT_DIR, cached) if not os.path.isabs(cached) else cached
@@ -1308,7 +1152,7 @@ def generate_image(prompt, seed=None):
 
         url = "https://api.imagerouter.io/v1/openai/images/generations"
         payload = {
-            "prompt": filtered_prompt,
+            "prompt": prompt,
             # Use HiDream model by default per user request
             "model": app_state.available_models[0] if app_state.available_models else "HiDream-ai/HiDream-I1-Full:free",
             "response_format": "b64_json"
@@ -1342,7 +1186,7 @@ def generate_image(prompt, seed=None):
 
             if is_rate_limit:
                 print("Detected ImageRouter rate limit — attempting AI Horde fallback")
-                aihorde_filename, aihorde_msg = generate_image_ai_horde(filtered_prompt, seed=seed)
+                aihorde_filename, aihorde_msg = generate_image_ai_horde(prompt, seed=seed)
                 if aihorde_filename:
                     return aihorde_filename, f"AI Horde fallback: {aihorde_msg}"
                 else:
@@ -1391,7 +1235,7 @@ def generate_image(prompt, seed=None):
         # Attempt AI Horde fallback on unexpected exceptions as well
         try:
             print("Attempting AI Horde fallback after exception")
-            aihorde_filename, aihorde_msg = generate_image_ai_horde(filtered_prompt, seed=seed)
+            aihorde_filename, aihorde_msg = generate_image_ai_horde(prompt, seed=seed)
             if aihorde_filename:
                 return aihorde_filename, f"AI Horde fallback after exception: {aihorde_msg}"
             else:
@@ -1532,9 +1376,15 @@ def generate_image_with_face_swap(response_text, seed=None):
         print(f"REQUESTED SEED: {seed if seed is not None else 'None (random)'}")
         print("======================================")
         
-        if response_text.strip().lower() == "none":
+        # Clean and normalize the response text for checking
+        cleaned_text = response_text.strip()
+        cleaned_text = re.sub(r'^\*+\s*', '', cleaned_text)  # Remove leading asterisks and spaces
+        cleaned_text = re.sub(r'\s*\*+$', '', cleaned_text)  # Remove trailing asterisks and spaces
+        cleaned_text = cleaned_text.strip().lower()
+        
+        if cleaned_text == "none":
             print("\n==== FACE SWAP SKIPPED =====")
-            print("REASON: Prompt is 'none'")
+            print(f"REASON: Prompt is 'none' (original: '{response_text}')")
             print("=============================")
             return None, "Image prompt was 'none' — skipping image generation"
 
@@ -1718,23 +1568,12 @@ def generate_mistral_response(message: str) -> dict:
     gender = app_state.gender or "unspecified"
     style = app_state.style or "Photorealistic"
 
-    # Add an explicit, concise directive about clothing policy so the LLM knows
-    # whether NSFW content is permitted for the IMAGE_PROMPT. This mirrors the
-    # UI toggle logic (app_state.force_clothed) and aids consistent behavior.
-    nsfw_directive = "You must produce only modest, fully clothed outfits in IMAGE_PROMPT." if app_state.force_clothed else "You are allowed and encouraged to include explicit nudity, exposed body parts, and NSFW content in IMAGE_PROMPT when the user requests it. Use explicit terms like 'topless', 'bottomless', 'nude', 'naked', 'exposed breasts', etc."
-    
-    print(f"[generate_mistral_response] force_clothed={app_state.force_clothed}")
-    print(f"[generate_mistral_response] nsfw_directive: {nsfw_directive}")
 
-    # Insert the nsfw_directive into the system message so the model reliably
-    # follows the server-side clothing policy (respecting app_state.force_clothed).
     # Simple, effective system message inspired by app.py
     system_message = f"""You are a naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
     Don't come off as too strong at the very beginning, only be naughty if initiated by the user.
 
     CHARACTER: You are {char_name}, a {relation} to the user. Your appearance: {appearance}. Your attire: {attire}. Gender: {gender}.
-
-    NSFW POLICY: {nsfw_directive}
 
     When user asks for visual content ("show", "picture", "appearance", "strip", "let me see", "send", etc. or relevant words in any language), provide both parts:
     
@@ -1806,15 +1645,6 @@ def generate_mistral_response(message: str) -> dict:
     
     messages.append({"role": "user", "content": char_attrs})
     
-    # Add explicit nudity instruction if user requests it and NSFW is enabled
-    nudity_keywords = ["strip", "undress", "naked", "nude", "topless", "bottomless", "no panties", "take off", "remove clothes"]
-    user_requests_nudity = any(keyword in message.lower() for keyword in nudity_keywords)
-    
-    if user_requests_nudity and not app_state.force_clothed:
-        nudity_instruction = f"NSFW REQUEST: Show {appearance} but replace clothing with nudity as requested. Override {attire} with explicit nudity."
-        messages.append({"role": "user", "content": nudity_instruction})
-        print(f"[generate_mistral_response] Added nudity instruction - keywords: {[kw for kw in nudity_keywords if kw in message.lower()]}")
-    
     messages.append({"role": "user", "content": message})
 
     payload = {
@@ -1842,23 +1672,37 @@ def generate_mistral_response(message: str) -> dict:
             chat_response = ""
             image_prompt = "none"
 
-            # Extract chat response (case-insensitive) and image prompt
-            chat_match = re.search(r"chat_response:\s*(.*?)(?=image_prompt:|$)", full_response, re.IGNORECASE | re.DOTALL)
+            # Extract chat response (case-insensitive) and image prompt - handle markdown formatting
+            chat_match = re.search(r"\*?\*?chat_response:\*?\*?\s*(.*?)(?=\*?\*?image_prompt:|$)", full_response, re.IGNORECASE | re.DOTALL)
             if chat_match:
                 chat_response = chat_match.group(1).strip()
 
-            prompt_match = re.search(r"image_prompt:\s*(.*?)$", full_response, re.IGNORECASE | re.DOTALL)
+            prompt_match = re.search(r"\*?\*?image_prompt:\*?\*?\s*(.*?)$", full_response, re.IGNORECASE | re.DOTALL)
             if prompt_match:
                 image_prompt = prompt_match.group(1).strip()
+
+            # Clean up markdown formatting from responses
+            if chat_response:
+                chat_response = re.sub(r'^\*?\*?', '', chat_response)  # Remove leading asterisks
+                chat_response = re.sub(r'\*?\*?$', '', chat_response)  # Remove trailing asterisks
+                chat_response = chat_response.strip()
+            
+            if image_prompt:
+                image_prompt = re.sub(r'^\*?\*?', '', image_prompt)    # Remove leading asterisks
+                image_prompt = re.sub(r'\*?\*?$', '', image_prompt)    # Remove trailing asterisks  
+                image_prompt = image_prompt.strip()
 
             # If the assistant didn't follow the exact format, fall back heuristics
             if not chat_response:
                 # Try to find a natural-language assistant reply before any 'IMAGE_PROMPT' marker
-                parts = re.split(r"image_prompt:\s*", full_response, flags=re.IGNORECASE)
+                parts = re.split(r"\*?\*?image_prompt:\*?\*?\s*", full_response, flags=re.IGNORECASE)
                 if len(parts) > 1:
                     # Take everything before the image_prompt marker as chat response
                     chat_response = parts[0].strip()
                     image_prompt = parts[1].strip()
+                    # Clean up any remaining markdown
+                    chat_response = re.sub(r'^\*?\*?', '', chat_response).strip()
+                    image_prompt = re.sub(r'^\*?\*?', '', image_prompt).strip()
                 else:
                     # No marker at all — treat full response as chat_response
                     chat_response = full_response.strip()
@@ -1901,27 +1745,7 @@ def should_generate_image(response: str) -> bool:
     return any(trigger in response_lower for trigger in visual_triggers)
 
 # ✅ Genitalia Enhancement Logic
-def apply_explicit_genitalia_enhancement(prompt: str, gender: str, force_clothed: bool) -> str:
-    if force_clothed:
-        return prompt
 
-    prompt_lower = prompt.lower()
-    bottom_off_keywords = [
-        "bottomless", "no panties", "panties removed", "panties off",
-        "fully nude", "naked from below", "wearing only a top",
-        "no skirt", "petticoat removed", "without panties"
-    ]
-    bottom_off = any(kw in prompt_lower for kw in bottom_off_keywords)
-
-    if bottom_off:
-        if gender == "female" and not any(term in prompt_lower for term in ["vagina", "pussy"]):
-            prompt += ", visible wet vagina"
-        elif gender == "male" and not any(term in prompt_lower for term in ["penis", "cock"]):
-            prompt += ", visible erect penis"
-        elif gender == "ambiguous" and "genitals" not in prompt_lower:
-            prompt += ", exposed genitals"
-
-    return prompt
 
 def extract_camera_angle(user_message: str) -> Optional[str]:
     """Extract a camera angle direction from user message"""
@@ -2252,12 +2076,6 @@ async def chat(chat_message: ChatMessage):
     app_state.chat_history.append(current_exchange)
     # Toggle clothing protection based on message content and token length
 
-    # Evaluate the current message
-    print(f"NSFW filter state BEFORE evaluation: force_clothed={app_state.force_clothed}")
-    reason = evaluate_nsfw_toggle(message)
-    print(f"NSFW toggle evaluation result: {reason}")
-    print(f"NSFW filter state AFTER evaluation: force_clothed={app_state.force_clothed}")
-
     # Generate a response. If the message requests an image, add a brief hint so the LLM returns IMAGE_PROMPT.
     msg_for_mistral = ("[GENERATE_IMAGE] " + message) if message_requests_image(message) else message
     response_data = generate_mistral_response(msg_for_mistral)
@@ -2274,11 +2092,17 @@ async def chat(chat_message: ChatMessage):
     
     # Check if this is the first message (excluding system initialization)
     is_first_chat = len(app_state.chat_history) <= 1
-    if is_first_chat and app_state.physical_description and image_prompt and image_prompt.lower().strip() != "none":
+    # Clean image_prompt for checking
+    cleaned_image_prompt = image_prompt.strip() if image_prompt else ""
+    cleaned_image_prompt = re.sub(r'^\*+\s*', '', cleaned_image_prompt)  # Remove leading asterisks
+    cleaned_image_prompt = re.sub(r'\s*\*+$', '', cleaned_image_prompt)  # Remove trailing asterisks
+    cleaned_image_prompt = cleaned_image_prompt.strip().lower()
+    
+    if is_first_chat and app_state.physical_description and cleaned_image_prompt and cleaned_image_prompt != "none":
         print("Appending physical description to first image prompt")
         image_prompt = f"{app_state.physical_description}, " + image_prompt
 
-    if image_prompt and image_prompt.lower().strip() != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
+    if cleaned_image_prompt and cleaned_image_prompt != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
         # Extract camera angle from user message if present
         camera_angle = extract_camera_angle(message)
         if camera_angle:
@@ -2286,9 +2110,7 @@ async def chat(chat_message: ChatMessage):
             if camera_angle not in image_prompt.lower():
                 image_prompt += f", {camera_angle}"
                 
-        # Apply genitalia enhancement if NSFW filter is disabled
-        if not app_state.force_clothed:
-            image_prompt = apply_explicit_genitalia_enhancement(image_prompt, app_state.gender.lower(), app_state.force_clothed)
+
 
         # Generate image using the dedicated image prompt
         image_path, image_message = generate_image_with_face_swap(image_prompt)
@@ -2318,29 +2140,6 @@ async def chat(chat_message: ChatMessage):
     )
 
 
-@app.post("/debug_nsfw")
-async def debug_nsfw(chat_message: ChatMessage):
-    """Apply NSFW toggle logic to the provided message and return the resulting state.
-
-    Useful for quick debugging of the NSFW toggle behavior without going through the full chat flow.
-    """
-    message = chat_message.message
-    lower_msg = message.lower()
-    tokens = len(message.split())
-
-    prev = app_state.force_clothed
-    reason = evaluate_nsfw_toggle(message)
-
-    return JSONResponse(
-        content={
-            "previous_force_clothed": prev,
-            "current_force_clothed": app_state.force_clothed,
-            "reason": reason,
-            "message": message,
-            "tokens": tokens
-        },
-        status_code=200
-    )
 
 @app.post("/clear_chat", response_model=dict)
 async def clear_chat():
@@ -2661,8 +2460,14 @@ def create_ui(launch: bool = True):
                         image_display = None
                         image_message = None
 
+                        # Clean and check image_prompt for markdown formatting
+                        cleaned_gradio_prompt = image_prompt.strip() if image_prompt else ""
+                        cleaned_gradio_prompt = re.sub(r'^\*+\s*', '', cleaned_gradio_prompt)  # Remove leading asterisks
+                        cleaned_gradio_prompt = re.sub(r'\s*\*+$', '', cleaned_gradio_prompt)  # Remove trailing asterisks
+                        cleaned_gradio_prompt = cleaned_gradio_prompt.strip().lower()
+                        
                         # Decide whether to generate an image
-                        if image_prompt and image_prompt.lower() != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
+                        if cleaned_gradio_prompt and cleaned_gradio_prompt != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
                             img_path, img_msg = generate_image_with_face_swap(image_prompt)
                             image_message = img_msg
                             if img_path:
