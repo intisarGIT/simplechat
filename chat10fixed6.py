@@ -381,6 +381,7 @@ def generate_preview_from_ui(face_upload_value=None, physical_description=None, 
         
         # Update other character attributes if provided
         if physical_description is not None:
+            print(f"[DEBUG] Setting physical_description in generate_character_preview: '{physical_description}'")
             app_state.physical_description = physical_description
         if initial_attire is not None:
             app_state.initial_attire = initial_attire
@@ -1706,6 +1707,7 @@ def generate_mistral_response(message: str) -> dict:
                              for msg in context_messages if 'user' in msg])
     # Create the system message for roleplay
     # Build a richer system message that explicitly includes the saved character attributes
+    print(f"[DEBUG] generate_mistral_response START - current physical_description: '{app_state.physical_description}'")
     char_name = app_state.character_name or "Fantasy Character"
     relation = app_state.relation_to_user or "companion"
     user_name = app_state.user_name or "user"
@@ -2039,6 +2041,7 @@ async def upload_character(
         app_state.source_face = None
         app_state.source_img = source_img
         app_state.face_image_path = file_location
+        print(f"[DEBUG] Setting physical_description in setup_character: '{physical_description}'")
         app_state.physical_description = physical_description
         app_state.behavioral_description = behavioral_description
         app_state.character_name = character_name
@@ -2271,11 +2274,11 @@ async def chat(chat_message: ChatMessage):
     
     # Check if this is the first message (excluding system initialization)
     is_first_chat = len(app_state.chat_history) <= 1
-    if is_first_chat and app_state.physical_description and image_prompt != "none":
+    if is_first_chat and app_state.physical_description and image_prompt and image_prompt.lower().strip() != "none":
         print("Appending physical description to first image prompt")
         image_prompt = f"{app_state.physical_description}, " + image_prompt
 
-    if image_prompt != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
+    if image_prompt and image_prompt.lower().strip() != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
         # Extract camera angle from user message if present
         camera_angle = extract_camera_angle(message)
         if camera_angle:
@@ -2447,6 +2450,7 @@ def create_ui(launch: bool = True):
                                 
                                 # Set the face image path in app_state so the standalone function can use it
                                 app_state.face_image_path = face_upload.value
+                                print(f"[DEBUG] Setting physical_description in Gradio UI #1: '{physical_desc.value}'")
                                 app_state.physical_description = physical_desc.value
                                 app_state.initial_attire = initial_attire.value
                                 app_state.gender = gender.value
@@ -2502,6 +2506,7 @@ def create_ui(launch: bool = True):
                                 app_state.source_face = None
                                 app_state.source_img = source_img
                                 app_state.face_image_path = dest_path
+                                print(f"[DEBUG] Setting physical_description in save_character: '{physical_desc}'")
                                 app_state.physical_description = physical_desc
                                 app_state.behavioral_description = behavioral_desc
                                 app_state.character_name = name
