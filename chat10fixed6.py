@@ -1127,8 +1127,12 @@ def generate_image(prompt, seed=None):
         # Prepare ImageRouter request
         api_key = app_state.imagerouter_api_key or os.getenv("IMAGEROUTER_API_KEY", "")
         if not api_key:
-            print("ERROR: ImageRouter API key not configured")
-            return None, "ImageRouter API key not configured"
+            print("ERROR: ImageRouter API key not configured, attempting Pollinations fallback")
+            pollinations_filename, pollinations_msg = generate_image_pollinations(prompt, seed=seed)
+            if pollinations_filename:
+                return pollinations_filename, f"Pollinations API fallback: {pollinations_msg}"
+            else:
+                return None, f"ImageRouter API key not configured and Pollinations fallback failed: {pollinations_msg}"
 
         url = "https://api.imagerouter.io/v1/openai/images/generations"
         # Use HiDream model - the only viable free option
@@ -2173,72 +2177,85 @@ async def chat(chat_message: ChatMessage):
     if cleaned_image_prompt and cleaned_image_prompt != "none":
         print(f"[DEBUG] Image generation check - prompt: '{cleaned_image_prompt}', face_image_path: {getattr(app_state, 'face_image_path', None)}, source_img available: {getattr(app_state, 'source_img', None) is not None}")
         
-        # Ensure face data is loaded if available (for consistent face swapping)
-        face_data_status = ensure_face_data_loaded()
-        print(f"[DEBUG] Face data status: {face_data_status}")
+        # Check API keys before attempting generation
+        imagerouter_key = app_state.imagerouter_api_key or os.getenv("IMAGEROUTER_API_KEY", "")
+        pollinations_key = app_state.pollinations_api_key or os.getenv("POLLINATIONS_API_KEY", "")
+        print(f"[DEBUG] API Keys - ImageRouter: {'SET' if imagerouter_key else 'NOT SET'}, Pollinations: {'SET' if pollinations_key else 'NOT SET'}")
         
-        # Extract camera angle from user message if present
-        camera_angle = extract_camera_angle(message)
-        if camera_angle:
-            # Add camera angle to the prompt if not already present
-            if camera_angle not in image_prompt.lower():
-                image_prompt += f", {camera_angle}"
-                
-        print(f"[DEBUG] Attempting image generation with prompt: {image_prompt[:100]}...")
-
-        # Generate image using the dedicated image prompt (works with or without face data)
-        try:
-            image_path, image_message = generate_image_with_face_swap(image_prompt)
-            print(f"[DEBUG] Image generation result - path: {image_path}, message: {image_message}")
+        if not imagerouter_key and not pollinations_key:
+            print("[ERROR] No image generation API keys configured!")
+            image_message = "No image generation API keys configured. Please set IMAGEROUTER_API_KEY or POLLINATIONS_API_KEY environment variable."
+        else:
+            # Ensure face data is loaded if available (for consistent face swapping)
+            face_data_status = ensure_face_data_loaded()
+            print(f"[DEBUG] Face data status: {face_data_status}")
             
-            if image_path:
-                # Add image to image history with character data for persistence
-                image_entry = {
-                    "path": image_path,
-                    "prompt": image_prompt,
-                    "timestamp": time.time(),
-                    # Store character data for recovery in case app_state is lost
-                    "character_data": {
-                        "physical_description": app_state.physical_description,
-                        "character_name": app_state.character_name,
-                        "behavioral_description": app_state.behavioral_description,
-                        "initial_attire": app_state.initial_attire,
-                        "gender": app_state.gender,
-                        "style": app_state.style,
-                        "clothing_state": getattr(app_state, 'current_clothing_state', 'dressed')
-                    }
-                }
-                app_state.image_history.append(image_entry)
+            # Extract camera angle from user message if present
+            camera_angle = extract_camera_angle(message)
+            if camera_angle:
+                # Add camera angle to the prompt if not already present
+                if camera_angle not in image_prompt.lower():
+                    image_prompt += f", {camera_angle}"
+                    
+            print(f"[DEBUG] Attempting image generation with prompt: {image_prompt[:100]}...")
 
-                # Construct full path to the image
-                full_image_path = os.path.join(OUTPUT_DIR, image_path)
-                print(f"[DEBUG] Reading image from: {full_image_path}")
+            # Generate image using the dedicated image prompt (works with or without face data)
+            try:
+                print(f"[DEBUG] Calling generate_image_with_face_swap...")
+                image_path, image_message = generate_image_with_face_swap(image_prompt)
+                print(f"[DEBUG] Image generation result - path: {image_path}, message: {image_message}")
                 
-                # Check if file exists before trying to read (with retry for timing issues)
-                if os.path.exists(full_image_path):
-                    # Read and encode the image as base64
-                    with open(full_image_path, "rb") as image_file:
-                        image_data = base64.b64encode(image_file.read()).decode('utf-8')
-                    print(f"[DEBUG] Successfully encoded image data ({len(image_data)} characters)")
-                else:
-                    # Sometimes there can be a small delay in file system operations
-                    print(f"[DEBUG] Image file not immediately found, waiting 1 second...")
-                    import time
-                    time.sleep(1)
+                if image_path:
+                    # Add image to image history with character data for persistence
+                    image_entry = {
+                        "path": image_path,
+                        "prompt": image_prompt,
+                        "timestamp": time.time(),
+                        # Store character data for recovery in case app_state is lost
+                        "character_data": {
+                            "physical_description": app_state.physical_description,
+                            "character_name": app_state.character_name,
+                            "behavioral_description": app_state.behavioral_description,
+                            "initial_attire": app_state.initial_attire,
+                            "gender": app_state.gender,
+                            "style": app_state.style,
+                            "clothing_state": getattr(app_state, 'current_clothing_state', 'dressed')
+                        }
+                    }
+                    app_state.image_history.append(image_entry)
+
+                    # Construct full path to the image
+                    full_image_path = os.path.join(OUTPUT_DIR, image_path)
+                    print(f"[DEBUG] Reading image from: {full_image_path}")
+                    
+                    # Check if file exists before trying to read (with retry for timing issues)
                     if os.path.exists(full_image_path):
+                        # Read and encode the image as base64
                         with open(full_image_path, "rb") as image_file:
                             image_data = base64.b64encode(image_file.read()).decode('utf-8')
-                        print(f"[DEBUG] Successfully encoded image data after retry ({len(image_data)} characters)")
+                        print(f"[DEBUG] Successfully encoded image data ({len(image_data)} characters)")
                     else:
-                        print(f"[ERROR] Image file not found at {full_image_path} even after retry")
-                        image_message = f"Image generated but file not found: {image_path}"
-            else:
-                print(f"[DEBUG] No image generated - {image_message}")
-        except Exception as e:
-            print(f"[ERROR] Exception during image generation: {e}")
-            import traceback
-            print(traceback.format_exc())
-            image_message = f"Image generation failed: {str(e)}"
+                        # Sometimes there can be a small delay in file system operations
+                        print(f"[DEBUG] Image file not immediately found, waiting 1 second...")
+                        import time
+                        time.sleep(1)
+                        if os.path.exists(full_image_path):
+                            with open(full_image_path, "rb") as image_file:
+                                image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                            print(f"[DEBUG] Successfully encoded image data after retry ({len(image_data)} characters)")
+                        else:
+                            print(f"[ERROR] Image file not found at {full_image_path} even after retry")
+                            image_message = f"Image generated but file not found: {image_path}"
+                else:
+                    print(f"[DEBUG] No image generated - {image_message}")
+                    
+            except Exception as e:
+                print(f"[ERROR] Exception during image generation: {type(e).__name__}: {e}")
+                import traceback
+                full_traceback = traceback.format_exc()
+                print(f"[ERROR] Full traceback: {full_traceback}")
+                image_message = f"Image generation failed: {str(e)}"
+                # Continue execution - don't let image generation errors break the chat
 
     # Final debug logging before return
     print(f"[DEBUG] Final response - chat_response: {len(chat_response) if chat_response else 0} chars, image_data: {len(image_data) if image_data else 0} chars, image_message: {image_message}")
