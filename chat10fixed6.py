@@ -236,7 +236,9 @@ def evaluate_nsfw_toggle(msg: str):
     # Natural language triggers (allow nudity unless negated nearby)
     natural_triggers = [r"\bstrip\b", r"\bundress\b", r"\btake off\b", r"\bremove clothes\b", r"\bno panties\b",
                         r"\bbottomless\b", r"\bnaked\b", r"\bnude\b", r"\bbare\b", r"\bexpose\b", r"\bremove.*clothing\b", 
-                        r"\bremove.*shirt\b", r"\bremove.*dress\b", r"\bremove.*top\b", r"\btopless\b", r"\bno bra\b"]
+                        r"\bremove.*shirt\b", r"\bremove.*dress\b", r"\bremove.*top\b", r"\btopless\b", r"\bno bra\b",
+                        r"\bshow me naked\b", r"\bshow.*nude\b", r"\bshow.*topless\b", r"\bwithout.*clothes\b", 
+                        r"\bwithout.*shirt\b", r"\bwithout.*top\b", r"\buncover\b", r"\bexposed\b"]
     restore_phrases = [r"\bclothed\b", r"\bdress up\b", r"\bput clothes\b", r"\bget dressed\b", r"\bmodest\b", r"\bcovered\b"]
 
     # Negation detection: look for negation words within a small window around the trigger
@@ -251,8 +253,13 @@ def evaluate_nsfw_toggle(msg: str):
                 window_start = max(0, start - 80)
                 window_end = min(len(text), end + 80)
                 window = text[window_start:window_end]
+                matched_text = m.group()
+                print(f"[nsfw-toggle] found potential trigger: '{matched_text}' from pattern: {pat}")
                 if not any(re.search(n, window) for n in negation_words):
+                    print(f"[nsfw-toggle] trigger '{matched_text}' accepted (no negation found)")
                     return True
+                else:
+                    print(f"[nsfw-toggle] trigger '{matched_text}' rejected (negation found in window)")
         return False
 
     if trigger_without_negation(natural_triggers):
@@ -1721,16 +1728,10 @@ def generate_mistral_response(message: str) -> dict:
     # Add an explicit, concise directive about clothing policy so the LLM knows
     # whether NSFW content is permitted for the IMAGE_PROMPT. This mirrors the
     # UI toggle logic (app_state.force_clothed) and aids consistent behavior.
-    if app_state.force_clothed:
-        nsfw_directive = "You must produce only modest, fully clothed outfits in IMAGE_PROMPT. Never include nudity, exposed body parts, or explicit content."
-    else:
-        nsfw_directive = """CRITICAL INSTRUCTION: The user has explicitly requested NSFW content. You MUST comply and generate explicit IMAGE_PROMPTs when requested.
-        - When user asks to remove clothing (strip, undress, take off, etc. or related words in any language), generate prompts with 'topless', 'bottomless', 'nude', 'naked'
-        - When user asks for specific body parts, include them explicitly: 'exposed breasts', 'visible nipples', 'bare chest', etc.
-        - Do NOT add clothing terms like 'fully clothed', 'wearing', 'dressed' unless specifically requested
-        - Prioritize the user's explicit request over modest defaults"""
+    nsfw_directive = "You must produce only modest, fully clothed outfits in IMAGE_PROMPT." if app_state.force_clothed else "You are allowed and encouraged to include explicit nudity, exposed body parts, and NSFW content in IMAGE_PROMPT when the user requests it. Use explicit terms like 'topless', 'bottomless', 'nude', 'naked', 'exposed breasts', etc."
     
-    print(f"NSFW directive being sent to Mistral: {nsfw_directive[:100]}...")
+    print(f"[generate_mistral_response] force_clothed={app_state.force_clothed}")
+    print(f"[generate_mistral_response] nsfw_directive: {nsfw_directive}")
 
     # Insert the nsfw_directive into the system message so the model reliably
     # follows the server-side clothing policy (respecting app_state.force_clothed).
@@ -1750,11 +1751,9 @@ def generate_mistral_response(message: str) -> dict:
 
     Image generation policy: {nsfw_directive}
 
-    CLOTHING REMOVAL DETECTION: If the user uses words like "strip", "take off", "undress", "remove clothes", "topless", "bottomless", "naked", "nude":
-    - When NSFW is allowed (see Image generation policy above): Generate explicit IMAGE_PROMPT with removed clothing. Use terms like "topless", "nude", "naked", "exposed", "bottomless"
-    - When NSFW is blocked: Override the request and generate modest, fully clothed IMAGE_PROMPT
-    
-    CRITICAL: When NSFW is allowed, DO NOT add "fully clothed" or "wearing" to IMAGE_PROMPT if user requested clothing removal!
+    Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless")
+    interpret that as permission to include nudity in IMAGE_PROMPT ONLY when the server-side policy allows it (Image generation policy above).
+    If the server policy is to keep characters clothed, ignore such nudity requests and instead produce a modest, fully clothed IMAGE_PROMPT.
 
     MUST-GENERATE RULE: If the user's message contains any visual request or any of the following visual/NSFW triggers, you MUST produce a non-empty IMAGE_PROMPT (do NOT return "IMAGE_PROMPT: none"):
     ["show", "show me", "picture", "look like", "appearance", "see me", "what I look like", "strip", "undress", "take off", "remove clothes", "no panties", "bottomless", "naked", "nude", "expose"]
@@ -2265,12 +2264,9 @@ async def chat(chat_message: ChatMessage):
 
     # Generate a response. If the message requests an image, add a brief hint so the LLM returns IMAGE_PROMPT.
     msg_for_mistral = ("[GENERATE_IMAGE] " + message) if message_requests_image(message) else message
-    print(f"Message sent to Mistral: {msg_for_mistral}")
-    print(f"NSFW state when calling Mistral: force_clothed={app_state.force_clothed}")
     response_data = generate_mistral_response(msg_for_mistral)
     chat_response = response_data["chat_response"]
     image_prompt = response_data["image_prompt"]
-    print(f"Mistral returned IMAGE_PROMPT: {image_prompt}")
 
     # Store the assistant's response
     current_exchange["assistant"] = chat_response
@@ -2286,17 +2282,7 @@ async def chat(chat_message: ChatMessage):
         print("Appending physical description to first image prompt")
         image_prompt = f"{app_state.physical_description}, " + image_prompt
 
-    # Debug: Check character face status
-    print(f"=== CHARACTER FACE DEBUG ===")
-    print(f"face_image_path: {getattr(app_state, 'face_image_path', 'NOT SET')}")
-    print(f"source_img: {'SET' if getattr(app_state, 'source_img', None) is not None else 'NOT SET'}")
-    print(f"character_name: {getattr(app_state, 'character_name', 'NOT SET')}")
-    print(f"physical_description: {getattr(app_state, 'physical_description', 'NOT SET')}")
-    print(f"============================")
-
     if image_prompt != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
-        print(f"✅ CONDITION MET: Starting image generation with prompt: {image_prompt}")
-        
         # Extract camera angle from user message if present
         camera_angle = extract_camera_angle(message)
         if camera_angle:
@@ -2311,7 +2297,6 @@ async def chat(chat_message: ChatMessage):
         # Generate image using the dedicated image prompt
         image_path, image_message = generate_image_with_face_swap(image_prompt)
         if image_path:
-            print(f"✅ IMAGE GENERATED: {image_path}")
             # Add image to image history
             image_entry = {
                 "path": image_path,
@@ -2325,13 +2310,6 @@ async def chat(chat_message: ChatMessage):
             # Read and encode the image as base64
             with open(full_image_path, "rb") as image_file:
                 image_data = base64.b64encode(image_file.read()).decode('utf-8')
-        else:
-            print(f"❌ IMAGE GENERATION FAILED: {image_message}")
-    elif image_prompt == "none":
-        print("❌ NO IMAGE: Mistral returned IMAGE_PROMPT: none")
-    else:
-        print("❌ NO CHARACTER FACE: Cannot generate image without uploaded character face")
-        print("   - Please upload and save a character face in the Setup tab")
 
     return JSONResponse(
         content={
