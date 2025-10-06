@@ -1088,7 +1088,7 @@ def enhance_prompt_with_quality_terms(prompt):
         return prompt
     
     # Define quality enhancement terms
-    quality_terms = "photorealistic, intricate details, skin details, pores, vellus hair"
+    quality_terms = "full face visible, photorealistic, intricate details, skin details, pores, vellus hair"
     
     # Check if quality terms are already present to avoid duplication
     prompt_lower = prompt.lower()
@@ -1496,11 +1496,13 @@ def generate_image_with_face_swap(response_text, seed=None):
             # Store the last used prompt
             app_state.last_used_prompt = response_text
             print("\n==== FACE SWAP COMPLETE =====")
-            print(f"FINAL IMAGE: {os.path.basename(result_path)}")
+            final_filename = os.path.basename(result_path)
+            print(f"FINAL IMAGE FILENAME: {final_filename}")
+            print(f"FULL RESULT PATH: {result_path}")
             print(f"PROMPT SAVED FOR REGENERATION: {response_text[:50]}{'...' if len(response_text) > 50 else ''}")
             print("=============================")
 
-            return os.path.basename(result_path), "Image generated and face-swapped successfully"
+            return final_filename, "Image generated and face-swapped successfully"
         else:
             # No face uploaded - use the generated base image
             print("Skipping face swap; returning base generated image")
@@ -2226,7 +2228,19 @@ async def chat(chat_message: ChatMessage):
 
                     # Construct full path to the image
                     full_image_path = os.path.join(OUTPUT_DIR, image_path)
-                    print(f"[DEBUG] Reading image from: {full_image_path}")
+                    print(f"[DEBUG] image_path received: '{image_path}'")
+                    print(f"[DEBUG] OUTPUT_DIR: '{OUTPUT_DIR}'")
+                    print(f"[DEBUG] Constructed full_image_path: '{full_image_path}'")
+                    print(f"[DEBUG] File exists at full_image_path: {os.path.exists(full_image_path)}")
+                    
+                    # Debug: List all files in output directory
+                    try:
+                        output_files = os.listdir(OUTPUT_DIR)
+                        swapped_files = [f for f in output_files if 'swapped_' in f]
+                        print(f"[DEBUG] Files in output directory: {len(output_files)} total")
+                        print(f"[DEBUG] Swapped files found: {swapped_files}")
+                    except Exception as e:
+                        print(f"[DEBUG] Error listing output directory: {e}")
                     
                     # Check if file exists before trying to read (with retry for timing issues)
                     if os.path.exists(full_image_path):
