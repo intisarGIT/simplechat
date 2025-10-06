@@ -1,4 +1,5 @@
 gradio>=3.0
+gradio_client
 requests
 fastapi
 uvicorn[standard]

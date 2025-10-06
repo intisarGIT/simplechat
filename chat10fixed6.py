@@ -18,6 +18,12 @@ try:
     import torch
 except Exception:
     torch = None
+try:
+    from gradio_client import Client, handle_file
+except Exception:
+    Client = None
+    handle_file = None
+    print("Warning: gradio_client not available - Hugging Face fallback disabled")
     print("Optional dependency 'torch' not available — continuing without it.")
 
 # Optional hard-coded RapidAPI key (NOT recommended). Leave empty and prefer env/config vars.
@@ -274,6 +280,53 @@ def extract_face_from_image(image_path):
     except Exception as e:
         print(f"Error reading image in extract_face_from_image: {e}")
         return None, None
+
+
+def huggingface_face_swap(source_path, target_path, output_path):
+    """
+    Fallback face swap using Hugging Face Spaces API
+    """
+    try:
+        if Client is None:
+            print("Hugging Face gradio_client not available")
+            return False
+            
+        print("Attempting Hugging Face face swap fallback...")
+        
+        # Initialize client
+        client = Client("intisarhasnain/face-swap2")
+        
+        # Call the prediction API
+        result = client.predict(
+            sourceImage=handle_file(source_path),
+            sourceFaceIndex=1,
+            destinationImage=handle_file(target_path),
+            destinationFaceIndex=1,
+            api_name="/predict"
+        )
+        
+        print(f"Hugging Face API result: {result}")
+        
+        # Result should be a dict with 'path' key
+        if isinstance(result, dict) and 'path' in result:
+            result_path = result['path']
+            if os.path.exists(result_path):
+                # Copy the result to our output path
+                shutil.copy(result_path, output_path)
+                print(f"Hugging Face face swap successful, saved to {output_path}")
+                return True
+            else:
+                print(f"Hugging Face result path does not exist: {result_path}")
+                return False
+        else:
+            print(f"Unexpected Hugging Face result format: {result}")
+            return False
+            
+    except Exception as e:
+        print(f"Hugging Face face swap failed: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return False
 
 
 def swap_face(source_face, source_img, target_path, output_path):
@@ -1033,14 +1086,20 @@ def swap_face(source_face, source_img, target_path, output_path):
         print(f"Face++ merge failed: {e}")
         import traceback
         print(traceback.format_exc())
-        # We intentionally remove the local insightface fallback. If Face++ fails
-        # we will fall back to returning the original target image so the app
-        # remains functional without the heavy local dependency.
-        try:
-            shutil.copy(target_path, output_path)
+        
+        # Try Hugging Face fallback before giving up
+        print("Attempting Hugging Face fallback...")
+        if huggingface_face_swap(template_path, target_path, output_path):
+            print("Hugging Face fallback succeeded")
             return output_path
-        except Exception:
-            return None
+        else:
+            print("Hugging Face fallback also failed, returning original image")
+            # If all face swap methods fail, return the original target image
+            try:
+                shutil.copy(target_path, output_path)
+                return output_path
+            except Exception:
+                return None
 
 
 def detect_gender_from_description(description):
