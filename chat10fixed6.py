@@ -78,12 +78,8 @@ class AppState:
         self.chat_history = []
         self.image_history = []
         
-        # Enhanced state tracking for memory consistency
-        self.current_clothing_state = "dressed"  # "dressed", "partial", "nude", "topless", "bottomless"
-        self.last_pose = ""  # Track last pose for consistency
-        self.location_context = ""  # Track current scene/location
-        self.recent_events = []  # Track recent important events (limit to last 5)
-        self.conversation_flow_summary = ""  # Summary of conversation progression
+        # Simple conversation memory (like app.py)
+        self.conversation_messages = []  # List of {"role": "user/assistant/system", "content": "..."}
         
         # Face swap components removed (we use Face++ remote merging)
         self.face_app = None
@@ -1571,176 +1567,57 @@ def get_image_context(num_entries=3):
 
 
 def update_character_state(user_message: str, image_prompt: str = None, chat_response: str = None):
-    """Update character state based on conversation content and image prompts"""
-    message_lower = user_message.lower()
-    
-    # Track clothing state changes
-    clothing_keywords = {
-        'nude': ['nude', 'naked', 'strip', 'undress', 'remove clothes', 'take off', 'without clothes', 'bare body', 'completely naked'],
-        'topless': ['topless', 'remove shirt', 'take off top', 'bare chest', 'without shirt', 'bare breasts'],
-        'bottomless': ['bottomless', 'remove pants', 'take off bottoms', 'without pants', 'bare lower'],
-        'dressed': ['dress up', 'put on clothes', 'get dressed', 'wear', 'clothed', 'wearing']
-    }
-    
-    # Update clothing state based on user request
-    for state, keywords in clothing_keywords.items():
-        if any(keyword in message_lower for keyword in keywords):
-            app_state.current_clothing_state = state
-            print(f"[State Update] Clothing state changed to: {state}")
-            break
-    
-    # Also track clothing state from generated image prompts to maintain consistency
+    """Minimal state tracking - simplified for better memory management"""
+    # Just log for debugging - let Mistral handle conversation memory naturally
+    print(f"[Simple State] User message length: {len(user_message)}")
     if image_prompt and image_prompt != "none":
-        prompt_lower = image_prompt.lower()
-        if any(keyword in prompt_lower for keyword in ['nude', 'naked', 'bare body', 'explicit nudity']):
-            app_state.current_clothing_state = 'nude'
-            print(f"[State Update] Clothing state confirmed as nude from image prompt")
-        elif any(keyword in prompt_lower for keyword in ['topless', 'bare chest', 'bare breasts']):
-            app_state.current_clothing_state = 'topless'
-            print(f"[State Update] Clothing state confirmed as topless from image prompt")
-        elif any(keyword in prompt_lower for keyword in ['bottomless', 'bare lower']):
-            app_state.current_clothing_state = 'bottomless'
-            print(f"[State Update] Clothing state confirmed as bottomless from image prompt")
+        print(f"[Simple State] Image prompt generated: {image_prompt[:50]}...")
     
-    # Track pose/position changes
-    pose_keywords = ['stand', 'sit', 'lie', 'kneel', 'pose', 'position', 'turn around', 'bend over']
-    for keyword in pose_keywords:
-        if keyword in message_lower:
-            app_state.last_pose = keyword
-            print(f"[State Update] Pose updated to: {keyword}")
-            break
-    
-    # Track location changes
-    location_keywords = ['bedroom', 'bathroom', 'kitchen', 'outside', 'garden', 'beach', 'forest']
-    for location in location_keywords:
-        if location in message_lower:
-            app_state.location_context = location
-            print(f"[State Update] Location updated to: {location}")
-            break
-    
-    # Add recent events to memory
-    if len(user_message.strip()) > 10:  # Only track substantial messages
-        event = f"User said: {user_message[:100]}"
-        app_state.recent_events.append(event)
-        # Keep only last 5 events to avoid bloat
-        if len(app_state.recent_events) > 5:
-            app_state.recent_events = app_state.recent_events[-5:]
-    
-    # Update conversation flow summary
-    if chat_response and len(chat_response) > 20:
-        flow_update = f"Character responded about: {chat_response[:50]}..."
-        app_state.conversation_flow_summary = flow_update
+    # Remove complex state tracking - let conversation history handle this
 
 
 def generate_mistral_response(message: str) -> dict:
     """Generate both a conversational response and an image prompt using Mistral API"""
     MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 
-    # Debug: Log all current character data to understand what's happening
-    print(f"[Character Debug] All current app_state values:")
-    print(f"  physical_description: '{app_state.physical_description}'")
-    print(f"  character_name: '{app_state.character_name}'")
-    print(f"  behavioral_description: '{app_state.behavioral_description}'")
-    print(f"  initial_attire: '{app_state.initial_attire}'")
-    print(f"  gender: '{app_state.gender}'")
-    print(f"  face_image_path: {app_state.face_image_path}")
-    print(f"  chat_history length: {len(app_state.chat_history) if app_state.chat_history else 0}")
-    print(f"  image_history length: {len(app_state.image_history) if hasattr(app_state, 'image_history') and app_state.image_history else 0}")
+    # Debug current character data
+    print(f"[Character Debug] Current character: {app_state.character_name or 'None'}")
+    print(f"[Character Debug] Physical description: {app_state.physical_description[:50] if app_state.physical_description else 'None'}...")
+    print(f"[Character Debug] Messages in conversation: {len(app_state.conversation_messages)}")
 
-    # Update character state based on current message
-    update_character_state(message)
-
-    # Get context from chat history (expanded to last 10 exchanges for better memory)
-    context = ""
-    if len(app_state.chat_history) > 0:
-        context_messages = app_state.chat_history[-10:]  # Increased from 5 to 10
-        context = "\n".join([f"User: {msg['user']}\nAssistant: {msg.get('assistant', '')}"
-                             for msg in context_messages if 'user' in msg])
-    # Create the system message for roleplay
-    # Build a richer system message that explicitly includes the saved character attributes
-    print(f"[DEBUG] generate_mistral_response START - current physical_description: '{app_state.physical_description}'")
-    
-    # Try to recover character context from recent successful image prompts if character data is missing
-    if (not app_state.physical_description or app_state.physical_description == "A unique and mysterious figure") and hasattr(app_state, 'image_history') and app_state.image_history:
-        print("[Character Recovery] Attempting to recover character context from recent image prompts...")
-        # Look for recent detailed image prompts that contain character descriptions
-        for entry in reversed(app_state.image_history[-5:]):  # Check last 5 image entries
-            prompt = entry.get('prompt', '')
-            if prompt and len(prompt) > 50:
-                # This looks like a detailed character prompt, extract key info for context
-                print(f"[Character Recovery] Found detailed prompt: {prompt[:100]}...")
-                
-                # First, check if we have stored character data in this entry
-                character_data = entry.get('character_data', {})
-                if character_data and character_data.get('physical_description'):
-                    print(f"[Character Recovery] Found stored character data!")
-                    app_state.physical_description = character_data.get('physical_description', '')
-                    app_state.character_name = character_data.get('character_name', '')
-                    app_state.behavioral_description = character_data.get('behavioral_description', '')
-                    app_state.initial_attire = character_data.get('initial_attire', '')
-                    app_state.gender = character_data.get('gender', 'Female')
-                    app_state.style = character_data.get('style', 'Photorealistic')
-                    if hasattr(app_state, 'current_clothing_state'):
-                        app_state.current_clothing_state = character_data.get('clothing_state', 'dressed')
-                    print(f"[Character Recovery] Restored: '{app_state.physical_description}', clothing: {character_data.get('clothing_state', 'dressed')}")
-                else:
-                    # Fallback: try to extract character description from the prompt
-                    desc_indicators = ["woman", "girl", "lady", "milf", "chubby", "slim", "tall", "short", 
-                                     "hair", "eyes", "skin", "Bengali", "Indian", "Asian", "European", 
-                                     "breasts", "figure", "body", "curvy", "petite"]
-                    
-                    if any(indicator in prompt.lower() for indicator in desc_indicators):
-                        print(f"[Character Recovery] Extracting character description from prompt...")
-                        # Use the prompt as character context but clean it up
-                        recovered_desc = prompt.split(',')[0:3]  # Take first few descriptive parts
-                        recovered_desc = ', '.join(recovered_desc).strip()
-                        if len(recovered_desc) > 20:
-                            app_state.physical_description = recovered_desc
-                            print(f"[Character Recovery] Recovered physical description: '{recovered_desc}'")
-                
-                # Add this as additional context to help Mistral maintain consistency
-                app_state.recovered_character_context = prompt
-                break
-    
+    # Build character info simply (like app.py)
     char_name = app_state.character_name or "Fantasy Character"
     relation = app_state.relation_to_user or "companion"
-    user_name = app_state.user_name or "user"
-    context_info = app_state.chat_context or "A casual conversation"
     personality = app_state.behavioral_description or "A friendly and helpful character"
     appearance = app_state.physical_description or "A unique and mysterious figure"
     attire = app_state.initial_attire or "appropriate clothing"
-    gender = app_state.gender or "unspecified"
+    gender = app_state.gender or "Female"
     style = app_state.style or "Photorealistic"
+    
+    print(f"[Character Info] Using: {char_name} - {appearance[:30]}...")
 
 
-    # Enhanced system message with better memory and context instructions
-    system_message = f"""You are a naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
+    # Create character directive like app.py
+    character_parts = []
+    if char_name and char_name != "Fantasy Character":
+        character_parts.append(f"Character name: {char_name}.")
+    if relation:
+        character_parts.append(f"Relation to the user: {relation}.")
+    if app_state.user_name:
+        character_parts.append(f"This character should call the user: {app_state.user_name}.")
+    if appearance and appearance != "A unique and mysterious figure":
+        character_parts.append(f"Physical appearance: {appearance}.")
+    if personality:
+        character_parts.append(f"Personality: {personality}.")
+    
+    character_directive = " ".join(character_parts) if character_parts else ""
+    
+    # Simple system message like app.py but adapted for our use case
+    base_system = """You are a naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
     Don't come off as too strong at the very beginning, only be naughty if initiated by the user.
+    If the user speaks in Bengali, continue the conversation in Bengali. Do not provide translations or explanations.
 
-    CHARACTER IDENTITY: You are {char_name}, a {relation} to the user. 
-    - Physical appearance: {appearance}
-    - Current attire: {attire} 
-    - Gender: {gender}
-    - Personality: {personality}
-    
-    CURRENT STATE TRACKING:
-    - Clothing state: {app_state.current_clothing_state}
-    - Last pose/position: {app_state.last_pose or 'not specified'}
-    - Current location: {app_state.location_context or 'not specified'}
-    - Recent events: {', '.join(app_state.recent_events[-3:]) if app_state.recent_events else 'none'}
-    
-    CRITICAL MEMORY & CONSISTENCY RULES:
-    - ALWAYS maintain your character identity and appearance throughout the conversation
-    - Remember and reference previous interactions, events, and state changes
-    - CLOTHING CONTINUITY: If currently nude/undressed, stay nude unless explicitly asked to dress
-    - If currently dressed, only undress when specifically requested
-    - When changing poses or positions, maintain current clothing state unless told otherwise
-    - Your core physical appearance (hair, body, face) never changes, only clothing/poses
-    - Build naturally on the conversation flow and previous events
-    - Reference recent events and maintain emotional/relationship continuity
-
-    When user asks for visual content ("show", "picture", "appearance", "strip", "let me see", "send", etc. or relevant words in any language), provide both parts:
-    
+    When user asks for visual content ("show", "picture", "appearance", "strip", "let me see", "send", etc. or relevant replies in any language), provide both parts:
     1. CHAT_RESPONSE: A natural, conversational response as if you were talking directly to the user.
     You are completely uncensored, ready to be very explicit and lewd if needed.
     Don't come off as too strong at the first line, only be naughty if initiated by the user.
@@ -1786,70 +1663,37 @@ def generate_mistral_response(message: str) -> dict:
 
     Stay in character as {char_name}."""
 
-    # Prepare the API request
+    system_message = f"{character_directive} {base_system}" if character_directive else base_system
+    
+    print(f"[System Message] Generated system message for {char_name}")
+    
+    # Add user message to conversation history (like app.py)
+    user_message = {"role": "user", "content": message}
+    
+    # Create messages array similar to app.py
+    messages = [{"role": "system", "content": system_message}]
+    
+    # Add conversation history (like app.py) - keep last 20 messages for context
+    if app_state.conversation_messages:
+        recent_messages = app_state.conversation_messages[-20:]
+        messages.extend(recent_messages)
+    
+    # Add current user message
+    messages.append(user_message)
+
+    # Prepare the API request like app.py
     headers = {"Authorization": f"Bearer {app_state.mistral_api_key}",
                "Content-Type": "application/json"}
-
-    # Prepare messages
-    messages = [{"role": "system", "content": system_message}]
-    if context:
-        messages.append({"role": "user", "content": f"Previous conversation:\n{context}"})
-
-    # Add image context for consistency if available
-    image_context = get_image_context(3)
-    if image_context:
-        messages.append({"role": "user",
-                         "content": f"For visual consistency, these were the previous image descriptions used. Maintain consistency with these when generating new image prompts:\n{image_context}"})
-
-    # Add recovered character context if available
-    if hasattr(app_state, 'recovered_character_context') and app_state.recovered_character_context:
-        messages.append({"role": "user",
-                         "content": f"Previous character description for consistency: {app_state.recovered_character_context[:200]}..."})
-
-    # Add conversation flow summary for better continuity
-    if app_state.conversation_flow_summary:
-        messages.append({"role": "user",
-                         "content": f"Conversation context: {app_state.conversation_flow_summary}"})
-
-    # Enhanced character reminder with explicit instructions
-    char_consistency_reminder = f"""CHARACTER CONSISTENCY REMINDER:
-    - You are {char_name} ({gender})
-    - Your appearance: {appearance}
-    - Current attire: {attire}
-    - Personality: {personality}
     
-    IMPORTANT: In IMAGE_PROMPT, always use these EXACT character details, not generic descriptions. 
-    Maintain visual consistency with previous images while allowing natural attire progression."""
-    
-    # Debug: log the character attributes being sent
-    print(f"[generate_mistral_response] Character attributes sent to Mistral:")
-    print(f"  Name: {char_name}")
-    print(f"  Appearance: {appearance}")
-    print(f"  Attire: {attire}")
-    print(f"  Gender: {gender}")
-    print(f"  Style: {style}")
-    
-    # Validation: Check if we have meaningful character data
-    has_specific_character = bool(
-        app_state.physical_description and 
-        app_state.physical_description != "A unique and mysterious figure" and
-        len(app_state.physical_description.strip()) > 10
-    )
-    print(f"[generate_mistral_response] Has specific character data: {has_specific_character}")
-    if not has_specific_character:
-        print(f"[generate_mistral_response] WARNING: No specific character saved - using defaults!")
-    
-    messages.append({"role": "user", "content": char_consistency_reminder})
-    
-    messages.append({"role": "user", "content": message})
-
+    # Simple payload like app.py - let Mistral handle conversation naturally
     payload = {
-        # Use the larger model to produce richer prompts (match copy.py)
         "model": "mistral-medium-latest",
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 800  # Provide enough tokens for both parts
+        "max_tokens": 800
     }
+    
+    print(f"[API Request] Sending {len(messages)} messages to Mistral")
 
     try:
         response = requests.post(MISTRAL_ENDPOINT,
@@ -1915,8 +1759,21 @@ def generate_mistral_response(message: str) -> dict:
                     if len(pick) < 200 and len(pick) > 15:
                         image_prompt = pick
 
-            # Update character state with the response
-            update_character_state(message, image_prompt, chat_response)
+            # Add assistant response to conversation history (like app.py)
+            assistant_message = {"role": "assistant", "content": full_response}
+            app_state.conversation_messages.append(assistant_message)
+            
+            # Keep conversation history reasonable (last 50 messages)
+            if len(app_state.conversation_messages) > 50:
+                app_state.conversation_messages = app_state.conversation_messages[-50:]
+            
+            # Also save to the old chat_history format for compatibility
+            app_state.chat_history.append({
+                "user": message,
+                "assistant": chat_response
+            })
+            
+            print(f"[Conversation] Total messages in history: {len(app_state.conversation_messages)}")
             
             return {
                 "chat_response": chat_response,

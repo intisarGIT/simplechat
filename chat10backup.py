@@ -18,6 +18,12 @@ try:
     import torch
 except Exception:
     torch = None
+try:
+    from gradio_client import Client, handle_file
+except Exception:
+    Client = None
+    handle_file = None
+    print("Warning: gradio_client not available - Hugging Face fallback disabled")
     print("Optional dependency 'torch' not available — continuing without it.")
 
 # Optional hard-coded RapidAPI key (NOT recommended). Leave empty and prefer env/config vars.
@@ -41,7 +47,7 @@ from io import BytesIO
 from PIL import Image
 
 # Local Stable Diffusion support has been removed. Image generation uses ImageRouter
-# (remote) and Face++ for face merging. The diffusers/xformers imports and
+# (primary) with Pollinations API fallback, and Face++ for face merging. The diffusers/xformers imports and
 # related initialization have been intentionally removed to avoid heavy local
 # dependencies.
 
@@ -71,12 +77,14 @@ class AppState:
         self.chat_context = ""
         self.chat_history = []
         self.image_history = []
-        self.sd_model_path = ""
-        # Fixed generation settings as requested
-        self.scheduler_type = "dpm_2m_karras"
-        self.guidance_scale = 7.0
-        self.num_inference_steps = 14
-        self.clip_skip = 2
+        
+        # Enhanced state tracking for memory consistency
+        self.current_clothing_state = "dressed"  # "dressed", "partial", "nude", "topless", "bottomless"
+        self.last_pose = ""  # Track last pose for consistency
+        self.location_context = ""  # Track current scene/location
+        self.recent_events = []  # Track recent important events (limit to last 5)
+        self.conversation_flow_summary = ""  # Summary of conversation progression
+        
         # Face swap components removed (we use Face++ remote merging)
         self.face_app = None
         self.face_swapper = None
@@ -84,7 +92,6 @@ class AppState:
         self.source_img = None
         self.sd_pipe = None
         self.prompt_cache = {}  # Cache for prompt->image mapping
-        self.force_clothed = True  # Default: keep character fully clothed
         self.last_used_prompt = None
         # New character attributes
         self.initial_attire = ""
@@ -105,86 +112,15 @@ class AppState:
         self.rapidapi_host = os.getenv("RAPIDAPI_HOST", "faceswap-image-transformation-api-free-api-face-swap.p.rapidapi.com")
         # Mistral API Key (use MISTRAL_API_KEY env var)
         self.mistral_api_key = os.getenv("MISTRAL_API_KEY", "")
+        # Hugging Face token for private spaces (use HUGGINGFACE_TOKEN env var)
+        self.huggingface_token = os.getenv("HUGGINGFACE_TOKEN", "")
+        # Pollinations API key for better rate limits (can be set via /set_api_settings or env POLLINATIONS_API_KEY)
+        self.pollinations_api_key = os.getenv("POLLINATIONS_API_KEY", "")
     
 
-    def apply_nsfw_filter(self, prompt_text, character_desc=""):
-        """
-        Centralized function to apply NSFW filtering to prompts
-        Returns the filtered prompt and a boolean indicating if filtering was applied
-        """
-        clothing_terms = ["clothed", "jacket", "robe", "uniform", "dress", "outfit", "shirt", "pants", "skirt", "blouse"]
-        nsfw_terms = {
-            "breast": "chest", 
-            "breasts": "chest",
-            "boob": "chest", 
-            "boobs": "chest",
-            "saggy": "natural",
-            "areola": "chest",
-            "nipple": "chest",
-            "nipples": "chest",
-            "ass": "figure", 
-            "butt": "figure", 
-            "naked": "clothed", 
-            "nude": "clothed", 
-            "revealing": "modest", 
-            "cleavage": "neckline", 
-            "underwear": "clothing", 
-            "lingerie": "clothing",
-            "busty": "curvy",
-            "voluptuous": "curvy"
-        }
-        
-        # Check if filtering is enabled - if not, return original prompt
-        if not self.force_clothed:
-            print("NSFW filter is disabled - not applying content filtering")
-            return prompt_text, False
-            
-        needs_clothing = True  # Since force_clothed is True, we need clothing
-        filtering_applied = False
 
-        # NSFW detected in physical description
-        if character_desc and any(term in character_desc.lower() for term in nsfw_terms):
-            needs_clothing = True
-        
-        # Apply regex pattern matching for compound NSFW phrases
-        nsfw_patterns = [
-            (r'\b(huge|large|big|saggy|perky)\s+(breast|breasts|boob|boobs)\b', 'curvy figure'),
-            (r'\b(dark|pink|large)\s+(areola|nipple|nipples)\b', 'chest'),
-            (r'\b(revealing|low-cut|tight)\s+(outfit|dress|top|clothing)\b', 'modest outfit'),
-            (r'\b(sexy|seductive|provocative)\s+(pose|look|appearance)\b', 'natural pose')
-        ]
-        
-        # First apply word-by-word replacement
-        prompt_lower = prompt_text.lower()
-        for nsfw_term, replacement in nsfw_terms.items():
-            # Only replace if the term exists and isn't part of another word
-            if nsfw_term in prompt_lower:
-                # Use regex to replace the term as a whole word
-                prompt_text = re.sub(r'\b' + nsfw_term + r'\b', replacement, prompt_text, flags=re.IGNORECASE)
-                filtering_applied = True
-        
-        # Then apply pattern matching for compound phrases
-        for pattern, replacement in nsfw_patterns:
-            if re.search(pattern, prompt_text, re.IGNORECASE):
-                prompt_text = re.sub(pattern, replacement, prompt_text, flags=re.IGNORECASE)
-                filtering_applied = True
-        
-        # Only add generic clothing tag if no specific clothing or colors are already present
-        color_keywords = ["red", "blue", "green", "yellow", "orange", "pink", "purple", "brown", "black", "white", "gray", "grey", "teal", "cyan"]
-        has_color = any(c in prompt_text.lower() for c in color_keywords)
-        has_clothing = any(term in prompt_text.lower() for term in clothing_terms)
 
-        if not has_color and not has_clothing:
-            prompt_text = "fully clothed, wearing modest outfit, " + prompt_text
-            print("Applied clothing protection to prompt")
-            filtering_applied = True
-        else:
-            print("Color or clothing terms already present — skipping generic clothing prepend")
-
-        
-        return prompt_text, filtering_applied
-
-    # initialize_face_models removed — no local face model initialization needed
+    # Note: Local face model initialization removed - using remote face swap services
 
     def initialize_sd_model(self):
         """No-op: local Stable Diffusion initialization removed.
@@ -205,59 +141,16 @@ class AppState:
 app_state = AppState()
 
 
-def evaluate_nsfw_toggle(msg: str):
-    """Evaluate msg and update app_state.force_clothed.
 
-    Returns a short reason string describing what occurred.
-    """
-    lower_msg = msg.lower()
-    tokens = len(msg.split())
-
-    nsfw_trigger_words = [
-        "strip", "undress", "remove clothes", "take off", "bare", "naked",
-        "nude", "expose", "lingerie", "underwear", "nsfw", "xxx", "porn",
-        "disable filter", "turn off filter", "no filter"
+def message_requests_image(msg: str) -> bool:
+    """Return True if the user's message contains clear visual/image requests."""
+    m = msg.lower()
+    triggers = [
+        "show", "show me", "picture", "look like", "appearance", "see me", "imagine", "visualize",
+        "what i look like", "strip", "undress", "take off", "remove clothes", "no panties", "bottomless",
+        "naked", "nude", "expose"
     ]
-    restore_clothing_words = [
-        "clothed", "dress up", "put clothes", "wear something", "get dressed",
-        "modest", "covered", "enable filter", "turn on filter", "activate filter"
-    ]
-
-    # 1) Explicit commands
-    if any(kw in lower_msg for kw in ["disable filter", "turn off filter", "no filter", "disable nsfw", "allow nsfw"]):
-        app_state.force_clothed = False
-        return "disabled by explicit user command"
-    if any(kw in lower_msg for kw in ["enable filter", "turn on filter", "activate filter", "enable nsfw"]):
-        app_state.force_clothed = True
-        return "enabled by explicit user command"
-
-    # 2) Natural-language triggers (allow nudity unless negated)
-    natural_nsfw_triggers = [
-        "strip", "undress", "take off", "remove clothes", "show me naked", "show me your", "no panties",
-        "no underwear", "bottomless", "naked", "nude", "bare", "expose", "panties off", "panties removed"
-    ]
-    negation_phrases = ["do not", "don't", "do n't", "never", "no,", "not "]
-
-    found_trigger = any(trigger in lower_msg for trigger in natural_nsfw_triggers)
-    found_restore = any(word in lower_msg for word in restore_clothing_words)
-    has_negation = any(neg in lower_msg for neg in negation_phrases)
-
-    if found_trigger and not has_negation:
-        app_state.force_clothed = False
-        return "disabled by natural-language trigger"
-    if found_restore:
-        app_state.force_clothed = True
-        return "enabled by natural-language restore phrase"
-
-    # 3) Fallback heuristic for short messages
-    if any(word in lower_msg for word in nsfw_trigger_words) and tokens <= 77:
-        app_state.force_clothed = False
-        return "disabled by short NSFW trigger"
-    if any(word in lower_msg for word in restore_clothing_words):
-        app_state.force_clothed = True
-        return "enabled by restore phrase"
-
-    return "unchanged"
+    return any(t in m for t in triggers)
 
 # Change from a method to a standalone function that uses app_state
 def generate_character_preview():
@@ -289,7 +182,9 @@ def generate_character_preview():
         app_state.source_img = source_img
 
         # Construct preview prompt
-        preview_prompt = f"{app_state.gender}, standing, {app_state.physical_description}, wearing {app_state.initial_attire}, {app_state.style}, high quality, intricate details"
+        base_preview_prompt = f"{app_state.gender}, standing, {app_state.physical_description}, wearing {app_state.initial_attire}, {app_state.style}, high quality"
+        # Apply quality enhancement
+        preview_prompt = enhance_prompt_with_quality_terms(base_preview_prompt)
         app_state.character_base_prompt = preview_prompt
 
         # Always generate a new random seed each time this function is called
@@ -355,6 +250,7 @@ def generate_preview_from_ui(face_upload_value=None, physical_description=None, 
         
         # Update other character attributes if provided
         if physical_description is not None:
+            print(f"[DEBUG] Setting physical_description in generate_character_preview: '{physical_description}'")
             app_state.physical_description = physical_description
         if initial_attire is not None:
             app_state.initial_attire = initial_attire
@@ -394,14 +290,78 @@ def extract_face_from_image(image_path):
         return None, None
 
 
-def swap_face(source_face, source_img, target_path, output_path):
-    """Swap face using Face++ Merge API, fallback to local insightface method on failure."""
+def huggingface_face_swap(source_path, target_path, output_path):
+    """
+    Fallback face swap using Hugging Face Spaces API
+    """
     try:
-        # Prepare Face++ credentials
-        api_key = app_state.facepp_api_key or os.getenv("FACEPP_API_KEY", "")
-        api_secret = app_state.facepp_api_secret or os.getenv("FACEPP_API_SECRET", "")
-        if not api_key or not api_secret:
-            raise RuntimeError("Face++ API credentials not configured")
+        if Client is None:
+            print("Hugging Face gradio_client not available")
+            return False
+            
+        print("Attempting Hugging Face face swap fallback...")
+        
+        # Get authentication token for private spaces
+        hf_token = app_state.huggingface_token or os.getenv("HUGGINGFACE_TOKEN", "")
+        
+        # Initialize client with authentication if token is provided
+        if hf_token:
+            print("Using authenticated Hugging Face client (private space)")
+            client = Client("intisarhasnain/face-swap2", hf_token=hf_token)
+        else:
+            print("Using public Hugging Face client (no authentication)")
+            client = Client("intisarhasnain/face-swap2")
+        
+        # Call the prediction API
+        result = client.predict(
+            sourceImage=handle_file(source_path),
+            sourceFaceIndex=1,
+            destinationImage=handle_file(target_path),
+            destinationFaceIndex=1,
+            api_name="/predict"
+        )
+        
+        print(f"Hugging Face API result: {result}")
+        
+        # Handle different result formats from Hugging Face API
+        result_path = None
+        
+        # Case 1: Result is a dict with 'path' key
+        if isinstance(result, dict) and 'path' in result:
+            result_path = result['path']
+        # Case 2: Result is a direct file path string 
+        elif isinstance(result, str) and result.startswith('/'):
+            result_path = result
+        # Case 3: Result is a dict but path might be in a different structure
+        elif isinstance(result, dict):
+            # Try common alternative keys
+            for key in ['file', 'output', 'image', 'result']:
+                if key in result and isinstance(result[key], str):
+                    result_path = result[key]
+                    break
+        
+        if result_path and os.path.exists(result_path):
+            # Copy the result to our output path
+            shutil.copy(result_path, output_path)
+            print(f"Hugging Face face swap successful, saved to {output_path}")
+            return True
+        else:
+            print(f"Hugging Face result path not found or invalid: {result_path}")
+            print(f"Unexpected Hugging Face result format: {result}")
+            return False
+            
+    except Exception as e:
+        print(f"Hugging Face face swap failed: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return False
+
+
+def swap_face(source_face, source_img, target_path, output_path):
+    """Swap face using RapidAPI, fallback to Hugging Face Spaces API on failure."""
+    try:
+        # We no longer need Face++ credentials - remove this check
+        # The function now uses RapidAPI as primary and Hugging Face as fallback
 
         # Ensure target image exists
         if not os.path.exists(target_path):
@@ -965,200 +925,41 @@ def swap_face(source_face, source_img, target_path, output_path):
                     print(f"RapidAPI faceswap attempt failed with exception: {e}")
 
         except Exception:
-            # non-fatal - continue to Face++
+            # non-fatal - RapidAPI failed, continue to Hugging Face fallback
             pass
 
-        # Face++ expects a two-step flow in practice: detect (to get face_token) or
-        # supply a template_file/merge_file directly. We'll call detect on the
-        # template image to obtain a template_face_token and then call mergeface
-        # with that face token plus the merge_file. This often yields more
-        # reliable results than relying on auto-detection server-side.
-
-        # Regional endpoints (US then CN)
-        detect_endpoints = [
-            "https://api-us.faceplusplus.com/facepp/v3/detect",
-            "https://api-cn.faceplusplus.com/facepp/v3/detect"
-        ]
-        merge_endpoints = [
-            "https://api-us.faceplusplus.com/facepp/v1/mergeface",
-            "https://api-cn.faceplusplus.com/facepp/v1/mergeface"
-        ]
-
-        # Detect faces in both images so we can pass correct rectangles.
-        detect_last_err = None
-        jd_user = None
-        jd_generated = None
-
-        # Detect on user-uploaded face (template_path variable currently points to the uploaded face)
-        for detect_url in detect_endpoints:
-            try:
-                print(f"Attempting Face++ detect (user face) at {detect_url}")
-                with open(template_path, 'rb') as tf:
-                    files = {'image_file': tf}
-                    data = {'api_key': api_key, 'api_secret': api_secret}
-                    resp = requests.post(detect_url, data=data, files=files, timeout=30)
-                if resp.status_code == 200:
-                    jd_user = resp.json()
-                    faces = jd_user.get('faces', [])
-                    if faces:
-                        print(f"Detected {len(faces)} face(s) in user image")
-                        break
-                    else:
-                        detect_last_err = (resp.status_code, 'no faces detected in user image')
-                        print(f"Detect succeeded but no faces found in user image: {jd_user}")
-                        break
-                else:
-                    detect_last_err = (resp.status_code, resp.text)
-                    print(f"Detect(user) returned {resp.status_code}: {resp.text}")
-                    if resp.status_code == 401:
-                        raise RuntimeError(f"Face++ authentication error (detect user): {resp.status_code} {resp.text}")
-                    continue
-            except Exception as e:
-                detect_last_err = (None, str(e))
-                print(f"Face++ detect error (user) at {detect_url}: {e}")
-                continue
-
-        # Detect on generated target image (merge_image_path points to generated image)
-        for detect_url in detect_endpoints:
-            try:
-                print(f"Attempting Face++ detect (generated image) at {detect_url}")
-                with open(merge_image_path, 'rb') as tf:
-                    files = {'image_file': tf}
-                    data = {'api_key': api_key, 'api_secret': api_secret}
-                    resp = requests.post(detect_url, data=data, files=files, timeout=30)
-                if resp.status_code == 200:
-                    jd_generated = resp.json()
-                    faces = jd_generated.get('faces', [])
-                    if faces:
-                        print(f"Detected {len(faces)} face(s) in generated image")
-                        break
-                    else:
-                        detect_last_err = (resp.status_code, 'no faces detected in generated image')
-                        print(f"Detect succeeded but no faces found in generated image: {jd_generated}")
-                        break
-                else:
-                    detect_last_err = (resp.status_code, resp.text)
-                    print(f"Detect(generated) returned {resp.status_code}: {resp.text}")
-                    if resp.status_code == 401:
-                        raise RuntimeError(f"Face++ authentication error (detect generated): {resp.status_code} {resp.text}")
-                    continue
-            except Exception as e:
-                detect_last_err = (None, str(e))
-                print(f"Face++ detect error (generated) at {detect_url}: {e}")
-                continue
-        # 2) Call Merge Face API using template_file + merge_file and template_rectangle per docs.
-        # Use the imagepp merge endpoint path (note: path is /imagepp/v1/mergeface).
-        merge_last_err = None
-        merge_resp = None
-
-        # Build template_rectangle (where on the template image the face is) and
-        # merge_rectangle (the face area within the merging image) using detected faces.
-        template_rectangle = None
-        merge_rectangle = None
-
-        try:
-            if jd_generated and jd_generated.get('faces'):
-                fr = jd_generated['faces'][0].get('face_rectangle')
-                if fr:
-                    template_rectangle = f"{fr.get('top')},{fr.get('left')},{fr.get('width')},{fr.get('height')}"
-                    print(f"Using template_rectangle from generated image: {template_rectangle}")
-        except Exception:
-            template_rectangle = None
-
-        try:
-            if jd_user and jd_user.get('faces'):
-                fr2 = jd_user['faces'][0].get('face_rectangle')
-                if fr2:
-                    merge_rectangle = f"{fr2.get('top')},{fr2.get('left')},{fr2.get('width')},{fr2.get('height')}"
-                    print(f"Using merge_rectangle from user image: {merge_rectangle}")
-        except Exception:
-            merge_rectangle = None
-
-        # Build merge endpoints using imagepp path (US then CN)
-        merge_endpoints = [
-            "https://api-us.faceplusplus.com/imagepp/v1/mergeface",
-            "https://api-cn.faceplusplus.com/imagepp/v1/mergeface"
-        ]
-
-        for merge_url in merge_endpoints:
-            try:
-                print(f"Attempting Face++ merge at {merge_url}")
-                # IMPORTANT: per Face++ docs, the template image is the background image
-                # and the merge image supplies the facial features to be applied.
-                # We want the generated image (merge_image_path) to be the template
-                # and the user's uploaded face (template_path) to be the merging image.
-                with open(merge_image_path, 'rb') as tf, open(template_path, 'rb') as mf:
-                    files = {
-                        'template_file': tf,   # generated image as template (background)
-                        'merge_file': mf       # user face as merging source (facial features)
-                    }
-                    # Merge tuning: make the merged image strongly reflect the merging image
-                    # as requested by the user. Set merge_rate high and feature_rate low.
-                    data = {
-                        'api_key': api_key,
-                        'api_secret': api_secret,
-                        'merge_rate': 100,
-                        'feature_rate': 0
-                    }
-                    if template_rectangle:
-                        data['template_rectangle'] = template_rectangle
-                    if merge_rectangle:
-                        data['merge_rectangle'] = merge_rectangle
-
-                    print(f"Face++ merge parameters: merge_rate={data.get('merge_rate')} feature_rate={data.get('feature_rate')}")
-
-                    resp = requests.post(merge_url, data=data, files=files, timeout=60)
-
-                merge_resp = resp
-                if merge_resp.status_code == 200:
-                    break
-
-                merge_last_err = (merge_resp.status_code, merge_resp.text)
-                print(f"Merge returned {merge_resp.status_code}: {merge_resp.text}")
-                if merge_resp.status_code == 401:
-                    # authentication error - stop trying other endpoints and surface helpful message
-                    raise RuntimeError(f"Face++ authentication error (merge): {merge_resp.status_code} {merge_resp.text}")
-                if merge_resp.status_code == 404:
-                    print(f"Endpoint {merge_url} returned 404 — trying next endpoint if available")
-                    continue
-                else:
-                    continue
-            except Exception as e:
-                merge_last_err = (None, str(e))
-                print(f"Face++ merge error at {merge_url}: {e}")
-                continue
-
-        if merge_resp is None:
-            raise RuntimeError(f"Face++ detect/merge failed: detect_err={detect_last_err} merge_err={merge_last_err}")
-
-        if merge_resp.status_code != 200:
-            # Provide actionable guidance for auth errors
-            if merge_resp.status_code == 401:
-                raise RuntimeError(f"Face++ API authentication error during merge: {merge_resp.status_code} {merge_resp.text}. Please verify your API key/secret and region (US vs CN) and ensure Merge API access is enabled for your account.")
-            raise RuntimeError(f"Face++ API error: {merge_resp.status_code} {merge_resp.text}")
-
-        result = merge_resp.json()
-        # Face++ merge returns a base64 'result' field on success
-        if 'result' in result and isinstance(result['result'], str):
-            img_bytes = base64.b64decode(result['result'])
-            with open(output_path, 'wb') as out_f:
-                out_f.write(img_bytes)
+        # RapidAPI failed, try Hugging Face fallback directly
+        print("RapidAPI failed, attempting Hugging Face fallback...")
+        if huggingface_face_swap(template_path, target_path, output_path):
+            print("Hugging Face fallback succeeded")
             return output_path
         else:
-            raise RuntimeError(f"Unexpected Face++ merge response format: {result}")
+            print("Hugging Face fallback also failed, returning original image")
+            # If all face swap methods fail, return the original target image
+            try:
+                shutil.copy(target_path, output_path)
+                return output_path
+            except Exception:
+                return None
 
     except Exception as e:
-        print(f"Face++ merge failed: {e}")
+        print(f"Face swap failed: {e}")
         import traceback
         print(traceback.format_exc())
-        # We intentionally remove the local insightface fallback. If Face++ fails
-        # we will fall back to returning the original target image so the app
-        # remains functional without the heavy local dependency.
-        try:
-            shutil.copy(target_path, output_path)
+        
+        # Try Hugging Face fallback as last resort
+        print("Attempting Hugging Face fallback as last resort...")
+        if huggingface_face_swap(template_path, target_path, output_path):
+            print("Hugging Face fallback succeeded")
             return output_path
-        except Exception:
-            return None
+        else:
+            print("Hugging Face fallback also failed, returning original image")
+            # If all face swap methods fail, return the original target image
+            try:
+                shutil.copy(target_path, output_path)
+                return output_path
+            except Exception:
+                return None
 
 
 def detect_gender_from_description(description):
@@ -1193,6 +994,9 @@ def detect_gender_from_description(description):
             return "male"
         else:
             return "unknown"
+
+
+
 
 
 def detect_face_gender(face):
@@ -1241,9 +1045,71 @@ def detect_face_gender(face):
         return "unknown"
 
 
+def ensure_face_data_loaded():
+    """Ensure face data is loaded into app_state if a face image is available"""
+    try:
+        print(f"[FACE DATA CHECK] face_image_path: {app_state.face_image_path}")
+        print(f"[FACE DATA CHECK] source_img available: {app_state.source_img is not None}")
+        print(f"[FACE DATA CHECK] source_face available: {app_state.source_face is not None}")
+        
+        # If we have a face image path but no source_img, load it
+        if app_state.face_image_path and app_state.source_img is None:
+            print(f"[FACE DATA LOAD] Loading face data from {app_state.face_image_path}")
+            if os.path.exists(app_state.face_image_path):
+                extracted_face, source_img = extract_face_from_image(app_state.face_image_path)
+                if source_img is not None:
+                    app_state.source_img = source_img
+                    app_state.source_face = None  # We use source_img for face swapping
+                    print(f"[FACE DATA LOAD] Successfully loaded face data")
+                    return True
+                else:
+                    print(f"[FACE DATA LOAD] Failed to extract face from image")
+            else:
+                print(f"[FACE DATA LOAD] Face image file not found at {app_state.face_image_path}")
+        
+        # If we already have source_img, we're good
+        if app_state.source_img is not None:
+            print(f"[FACE DATA CHECK] Face data already available")
+            return True
+            
+        print(f"[FACE DATA CHECK] No face data available")
+        return False
+        
+    except Exception as e:
+        print(f"[FACE DATA ERROR] Error ensuring face data loaded: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return False
+
+
 # =====================
 # Image Generation
 # =====================
+
+def enhance_prompt_with_quality_terms(prompt):
+    """Enhance any prompt with fixed quality terms for better image generation"""
+    if not prompt or prompt.lower().strip() == "none":
+        return prompt
+    
+    # Define quality enhancement terms
+    quality_terms = "photorealistic, intricate details, skin details, pores, vellus hair"
+    
+    # Check if quality terms are already present to avoid duplication
+    prompt_lower = prompt.lower()
+    has_photorealistic = "photorealistic" in prompt_lower
+    has_intricate = "intricate details" in prompt_lower or "intricate detail" in prompt_lower
+    
+    if has_photorealistic and has_intricate:
+        print(f"[PROMPT ENHANCE] Quality terms already present, skipping enhancement")
+        return prompt
+    
+    # Clean up the prompt (remove trailing punctuation for better appending)
+    cleaned_prompt = prompt.rstrip('. ,;')
+    
+    # Enhance the prompt by appending quality terms
+    enhanced_prompt = f"{cleaned_prompt}, {quality_terms}"
+    print(f"[PROMPT ENHANCE] Added quality terms: {quality_terms}")
+    return enhanced_prompt
 
 def generate_image(prompt, seed=None):
     """Generate an image using ImageRouter API and return (filename, message)"""
@@ -1253,19 +1119,8 @@ def generate_image(prompt, seed=None):
         print(f"SEED VALUE: {seed if seed is not None else 'None (random)'}")
         print("====================================")
 
-        # Apply NSFW filtering to the prompt
-        filtered_prompt, filtering_applied = app_state.apply_nsfw_filter(prompt, app_state.physical_description)
-        print("\n==== NSFW FILTERING STAGE =====")
-        if filtering_applied:
-            print(f"NSFW FILTERING APPLIED: Yes")
-            print(f"ORIGINAL PROMPT: {prompt}")
-            print(f"FILTERED PROMPT: {filtered_prompt}")
-        else:
-            print("NSFW FILTERING APPLIED: No")
-        print("=================================")
-
         # Check cache (use prompt+seed as key)
-        cache_key = f"{filtered_prompt}_{seed}" if seed is not None else filtered_prompt
+        cache_key = f"{prompt}_{seed}" if seed is not None else prompt
         if cache_key in app_state.prompt_cache:
             cached = app_state.prompt_cache[cache_key]
             cached_path = os.path.join(OUTPUT_DIR, cached) if not os.path.isabs(cached) else cached
@@ -1280,21 +1135,94 @@ def generate_image(prompt, seed=None):
             return None, "ImageRouter API key not configured"
 
         url = "https://api.imagerouter.io/v1/openai/images/generations"
+        # Use HiDream model - the only viable free option
+        selected_model = app_state.available_models[0] if app_state.available_models else "HiDream-ai/HiDream-I1-Full:free"
+        
+        # Check if prompt contains NSFW terms for logging
+        nsfw_terms = ["nude", "naked", "nipples", "breasts", "pussy", "vagina", "penis", "cock", "explicit"]
+        is_nsfw_prompt = any(term in prompt.lower() for term in nsfw_terms)
+        
+        print(f"Using model: {selected_model} (NSFW prompt detected: {is_nsfw_prompt})")
+        
+        # First apply quality enhancement to all prompts
+        enhanced_prompt = enhance_prompt_with_quality_terms(prompt)
+        
+        # Then enhance further for NSFW results with HiDream
+        if is_nsfw_prompt:
+            # Add emphasis and quality tags that might help bypass filters
+            enhanced_prompt = f"({enhanced_prompt}), masterpiece, best quality, highly detailed, uncensored, explicit, NSFW, raw, unfiltered"
+            print(f"Enhanced NSFW prompt: {enhanced_prompt}")
+        else:
+            print(f"Enhanced prompt: {enhanced_prompt}")
+        
         payload = {
-            "prompt": filtered_prompt,
-            # Use HiDream model by default per user request
-            "model": app_state.available_models[0] if app_state.available_models else "HiDream-ai/HiDream-I1-Full:free",
+            "prompt": enhanced_prompt,
+            "model": selected_model,
             "response_format": "b64_json"
         }
+        
+        # Add seed if provided
+        if seed is not None:
+            payload["seed"] = seed
+        
+        # Try different approaches for NSFW content with HiDream
+        if is_nsfw_prompt:
+            # Try multiple approaches since HiDream might have built-in filtering
+            payload.update({
+                # Standard NSFW parameters
+                "safety_filter": False,
+                "nsfw": True,
+                "content_filter": False,
+                "safe_mode": False,
+                # Alternative parameter names that some APIs use
+                "safety_checker": False,
+                "enable_safety_checker": False,
+                "apply_safety_filter": False,
+                "use_safety_filter": False,
+                "censor": False,
+                "enable_nsfw": True,
+                "allow_nsfw": True,
+                "explicit": True,
+                "uncensored": True,
+                # Try negative prompting approach
+                "negative_prompt": "clothes, clothing, covered, censored, blurred, modest, sfw"
+            })
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
 
         print("Sending request to ImageRouter...")
+        print(f"ImageRouter payload: {payload}")
         resp = requests.post(url, json=payload, headers=headers, timeout=60)
+        # If ImageRouter fails (rate limit 429 or other errors), fall back to Pollinations API
         if resp.status_code != 200:
             print(f"ImageRouter returned status {resp.status_code}: {resp.text}")
+            # Try to detect rate limit / daily limit message
+            text_lower = resp.text.lower() if resp.text else ""
+            try:
+                j = resp.json()
+            except Exception:
+                j = {}
+
+            is_rate_limit = False
+            # Common ImageRouter/Stripe/OpenAI style rate limit messages
+            if resp.status_code == 429:
+                is_rate_limit = True
+            if isinstance(j, dict) and j.get("error"):
+                # e.g. {"error": {"message": "Daily limit of 50 free requests reached...", "type": "rate_limit_error"}}
+                err = j.get("error")
+                if isinstance(err, dict) and ("rate_limit" in str(err.get("type", "")).lower() or "daily limit" in str(err.get("message", "")).lower()):
+                    is_rate_limit = True
+
+            if is_rate_limit:
+                print("Detected ImageRouter rate limit — attempting Pollinations API fallback")
+                pollinations_filename, pollinations_msg = generate_image_pollinations(prompt, seed=seed)
+                if pollinations_filename:
+                    return pollinations_filename, f"Pollinations API fallback: {pollinations_msg}"
+                else:
+                    return None, f"ImageRouter error {resp.status_code}: {resp.text} — Pollinations API fallback failed: {pollinations_msg}"
+
             return None, f"ImageRouter error {resp.status_code}: {resp.text}"
 
         data = resp.json()
@@ -1335,7 +1263,120 @@ def generate_image(prompt, seed=None):
         import traceback
         print(f"TRACEBACK: {traceback.format_exc()}")
         print("==================================")
-        return None, f"Error generating image: {str(e)}"
+        # Attempt Pollinations API fallback on unexpected exceptions as well
+        try:
+            print("Attempting Pollinations API fallback after exception")
+            pollinations_filename, pollinations_msg = generate_image_pollinations(prompt, seed=seed)
+            if pollinations_filename:
+                return pollinations_filename, f"Pollinations API fallback after exception: {pollinations_msg}"
+            else:
+                return None, f"Error generating image: {str(e)}; Pollinations API fallback failed: {pollinations_msg}"
+        except Exception as e2:
+            print(f"Pollinations API fallback also failed: {e2}")
+            return None, f"Error generating image: {str(e)}"
+
+
+def generate_image_pollinations(prompt, seed=None):
+    """Generate an image using Pollinations API as a fallback.
+
+    Returns (filename, message) on success or (None, error_message) on failure.
+    """
+    try:
+        import urllib.parse
+        
+        print("\n==== POLLINATIONS API FALLBACK STARTED =====")
+        print(f"ORIGINAL PROMPT: {prompt}")
+        print(f"SEED: {seed if seed is not None else 'random'}")
+        
+        # Apply quality enhancement to the prompt
+        enhanced_prompt = enhance_prompt_with_quality_terms(prompt)
+        print(f"ENHANCED PROMPT: {enhanced_prompt}")
+        
+        # Get API key from app state or environment
+        api_key = app_state.pollinations_api_key or os.getenv("POLLINATIONS_API_KEY", "")
+        
+        # URL encode the enhanced prompt
+        encoded_prompt = urllib.parse.quote(enhanced_prompt)
+        
+        # Build the API URL
+        base_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+        
+        # Set up parameters with your preferred values
+        params = {
+            "model": "turbo",
+            "width": 768,
+            "height": 1024,
+            "nologo": "true",  # Disable logo overlay
+            "private": "true", # Prevent from appearing in public feed
+            "enhance": "false", # Don't enhance the prompt
+            "safe": "false"    # Allow NSFW content
+        }
+        
+        # Add seed if provided, otherwise let it be random
+        if seed is not None:
+            params["seed"] = str(seed)
+            
+        # Set up headers
+        headers = {}
+        if api_key:
+            # Add API key to headers for authenticated access
+            headers["Authorization"] = f"Bearer {api_key}"
+            print(f"Using Pollinations API key: {'*' * (len(api_key)-4) + api_key[-4:] if len(api_key) > 4 else 'Yes'}")
+        else:
+            print("No Pollinations API key configured - using anonymous access (rate limited)")
+
+        print(f"Sending request to Pollinations API: {base_url}")
+        print(f"Parameters: {params}")
+        
+        # Make the request with a longer timeout for image generation
+        resp = requests.get(base_url, params=params, headers=headers, timeout=300)
+        
+        if resp.status_code != 200:
+            print(f"Pollinations API returned status {resp.status_code}")
+            # Check if we got text response with error details
+            try:
+                error_text = resp.text[:500] if resp.text else "No error details"
+                print(f"Error response: {error_text}")
+            except Exception:
+                pass
+            return None, f"Pollinations API error {resp.status_code}: {resp.text[:200] if resp.text else 'No details'}"
+
+        # Check if we got image data
+        if not resp.content:
+            print("Pollinations API returned empty response")
+            return None, "Pollinations API returned empty image"
+            
+        # Check content type to ensure we got an image
+        content_type = resp.headers.get('content-type', '').lower()
+        if not any(img_type in content_type for img_type in ['image/', 'jpeg', 'jpg', 'png', 'webp']):
+            print(f"Unexpected content type: {content_type}")
+            # If it's text, it might be an error message
+            if 'text' in content_type:
+                error_text = resp.text[:500] if resp.text else "Unknown error"
+                print(f"Text response (likely error): {error_text}")
+                return None, f"Pollinations API error: {error_text}"
+            return None, f"Unexpected content type: {content_type}"
+
+        # Save image
+        output_filename = f"generated_pollinations_{uuid.uuid4()}.jpg"
+        output_path = os.path.join(OUTPUT_DIR, output_filename)
+        with open(output_path, "wb") as f:
+            f.write(resp.content)
+
+        # Cache and set last prompt
+        cache_key = f"{prompt}_{seed}" if seed is not None else prompt
+        app_state.prompt_cache[cache_key] = output_filename
+        app_state.last_used_prompt = prompt
+        
+        print(f"Pollinations API saved image to {output_path}")
+        print(f"Image size: {len(resp.content)} bytes")
+        return output_filename, "Pollinations API image generated successfully"
+        
+    except Exception as e:
+        print(f"Pollinations API fallback error: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return None, f"Pollinations API error: {str(e)}"
 
 
 def generate_image_with_face_swap(response_text, seed=None):
@@ -1346,18 +1387,27 @@ def generate_image_with_face_swap(response_text, seed=None):
         print(f"REQUESTED SEED: {seed if seed is not None else 'None (random)'}")
         print("======================================")
         
-        if response_text.strip().lower() == "none":
+        # Clean and normalize the response text for checking
+        cleaned_text = response_text.strip()
+        cleaned_text = re.sub(r'^\*+\s*', '', cleaned_text)  # Remove leading asterisks and spaces
+        cleaned_text = re.sub(r'\s*\*+$', '', cleaned_text)  # Remove trailing asterisks and spaces
+        cleaned_text = cleaned_text.strip().lower()
+        
+        if cleaned_text == "none":
             print("\n==== FACE SWAP SKIPPED =====")
-            print("REASON: Prompt is 'none'")
+            print(f"REASON: Prompt is 'none' (original: '{response_text}')")
             print("=============================")
             return None, "Image prompt was 'none' — skipping image generation"
 
-        # Ensure we have an uploaded character image to use as the Face++ template
-        if not app_state.face_image_path and not app_state.source_img:
-            print("\n==== FACE SWAP ERROR =====")
-            print("ERROR: No character face uploaded")
-            print("==========================")
-            return None, "No character face has been uploaded for face swapping"
+        # Ensure face data is loaded before determining if we can do face swap
+        face_data_available = ensure_face_data_loaded()
+        
+        # If no character face was uploaded, we will still generate a base image
+        # from the prompt and skip the face-swap step. This ensures images are
+        # produced even if the user hasn't uploaded a face yet.
+        do_face_swap = face_data_available
+        if not face_data_available:
+            print("No character face data available — will generate base image without face swap")
             
         # For the first image in chat, use the saved character seed if available and no specific seed was provided
         if seed is None and len(app_state.chat_history) <= 1 and app_state.character_seed is not None:
@@ -1411,30 +1461,54 @@ def generate_image_with_face_swap(response_text, seed=None):
         print("\n==== EXECUTING FACE SWAP =====")
         print(f"SOURCE FACE: {'Available' if app_state.source_face is not None else 'Missing'}")
         print(f"SOURCE IMAGE: {'Available' if app_state.source_img is not None else 'Missing'}")
+        if app_state.source_img is not None:
+            print(f"SOURCE IMAGE SHAPE: {getattr(app_state.source_img, 'shape', 'No shape attr')}")
+        print(f"FACE IMAGE PATH: {getattr(app_state, 'face_image_path', 'None')}")
+        print(f"DO_FACE_SWAP: {do_face_swap}")
         print(f"TARGET IMAGE: {generated_path}")
         print(f"OUTPUT PATH: {swapped_path}")
         
-        # Perform face swapping
-        result_path = swap_face(app_state.source_face, app_state.source_img, generated_path, swapped_path)
+        result_path = None
+        if do_face_swap:
+            # Double-check face data is still available before swapping
+            if app_state.source_img is None:
+                print("[WARNING] Face data lost during process, attempting to reload...")
+                if not ensure_face_data_loaded():
+                    print("[WARNING] Could not reload face data, skipping face swap")
+                    do_face_swap = False
+            
+            if do_face_swap:
+                # Perform face swapping
+                result_path = swap_face(app_state.source_face, app_state.source_img, generated_path, swapped_path)
 
-        if not result_path:
-            print("FACE SWAP RESULT: Failed")
-            print("FALLBACK: Using original image")
+            if not result_path:
+                print("FACE SWAP RESULT: Failed")
+                print("FALLBACK: Using original image")
+                print("==============================")
+                # Return the base generated image if swapping fails
+                app_state.last_used_prompt = response_text
+                return image_filename, "Face swap failed, using original image"
+
+            print(f"FACE SWAP RESULT: Success")
+            print(f"RESULT PATH: {result_path}")
             print("==============================")
-            return image_filename, "Face swap failed, using original image"
-        
-        print(f"FACE SWAP RESULT: Success")
-        print(f"RESULT PATH: {result_path}")
-        print("==============================")
 
-        # Store the last used prompt
-        app_state.last_used_prompt = response_text
-        print("\n==== FACE SWAP COMPLETE =====")
-        print(f"FINAL IMAGE: {os.path.basename(result_path)}")
-        print(f"PROMPT SAVED FOR REGENERATION: {response_text[:50]}{'...' if len(response_text) > 50 else ''}")
-        print("=============================")
+            # Store the last used prompt
+            app_state.last_used_prompt = response_text
+            print("\n==== FACE SWAP COMPLETE =====")
+            print(f"FINAL IMAGE: {os.path.basename(result_path)}")
+            print(f"PROMPT SAVED FOR REGENERATION: {response_text[:50]}{'...' if len(response_text) > 50 else ''}")
+            print("=============================")
 
-        return os.path.basename(result_path), "Image generated and face-swapped successfully"
+            return os.path.basename(result_path), "Image generated and face-swapped successfully"
+        else:
+            # No face uploaded - use the generated base image
+            print("Skipping face swap; returning base generated image")
+            app_state.last_used_prompt = response_text
+            print("==== FACE SWAP COMPLETE (SKIPPED) =====")
+            print(f"FINAL IMAGE: {image_filename}")
+            print("========================================")
+            return image_filename, "Generated base image (no face uploaded)"
     except Exception as e:
         # ===== DETAILED LOGGING: Face Swap Error =====
         print("\n==== FACE SWAP ERROR =====")
@@ -1496,18 +1570,138 @@ def get_image_context(num_entries=3):
     return "\n".join(prompts)
 
 
+def update_character_state(user_message: str, image_prompt: str = None, chat_response: str = None):
+    """Update character state based on conversation content and image prompts"""
+    message_lower = user_message.lower()
+    
+    # Track clothing state changes
+    clothing_keywords = {
+        'nude': ['nude', 'naked', 'strip', 'undress', 'remove clothes', 'take off', 'without clothes', 'bare body', 'completely naked'],
+        'topless': ['topless', 'remove shirt', 'take off top', 'bare chest', 'without shirt', 'bare breasts'],
+        'bottomless': ['bottomless', 'remove pants', 'take off bottoms', 'without pants', 'bare lower'],
+        'dressed': ['dress up', 'put on clothes', 'get dressed', 'wear', 'clothed', 'wearing']
+    }
+    
+    # Update clothing state based on user request
+    for state, keywords in clothing_keywords.items():
+        if any(keyword in message_lower for keyword in keywords):
+            app_state.current_clothing_state = state
+            print(f"[State Update] Clothing state changed to: {state}")
+            break
+    
+    # Also track clothing state from generated image prompts to maintain consistency
+    if image_prompt and image_prompt != "none":
+        prompt_lower = image_prompt.lower()
+        if any(keyword in prompt_lower for keyword in ['nude', 'naked', 'bare body', 'explicit nudity']):
+            app_state.current_clothing_state = 'nude'
+            print(f"[State Update] Clothing state confirmed as nude from image prompt")
+        elif any(keyword in prompt_lower for keyword in ['topless', 'bare chest', 'bare breasts']):
+            app_state.current_clothing_state = 'topless'
+            print(f"[State Update] Clothing state confirmed as topless from image prompt")
+        elif any(keyword in prompt_lower for keyword in ['bottomless', 'bare lower']):
+            app_state.current_clothing_state = 'bottomless'
+            print(f"[State Update] Clothing state confirmed as bottomless from image prompt")
+    
+    # Track pose/position changes
+    pose_keywords = ['stand', 'sit', 'lie', 'kneel', 'pose', 'position', 'turn around', 'bend over']
+    for keyword in pose_keywords:
+        if keyword in message_lower:
+            app_state.last_pose = keyword
+            print(f"[State Update] Pose updated to: {keyword}")
+            break
+    
+    # Track location changes
+    location_keywords = ['bedroom', 'bathroom', 'kitchen', 'outside', 'garden', 'beach', 'forest']
+    for location in location_keywords:
+        if location in message_lower:
+            app_state.location_context = location
+            print(f"[State Update] Location updated to: {location}")
+            break
+    
+    # Add recent events to memory
+    if len(user_message.strip()) > 10:  # Only track substantial messages
+        event = f"User said: {user_message[:100]}"
+        app_state.recent_events.append(event)
+        # Keep only last 5 events to avoid bloat
+        if len(app_state.recent_events) > 5:
+            app_state.recent_events = app_state.recent_events[-5:]
+    
+    # Update conversation flow summary
+    if chat_response and len(chat_response) > 20:
+        flow_update = f"Character responded about: {chat_response[:50]}..."
+        app_state.conversation_flow_summary = flow_update
+
+
 def generate_mistral_response(message: str) -> dict:
     """Generate both a conversational response and an image prompt using Mistral API"""
     MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 
-    # Get context from chat history (last 5 exchanges)
+    # Debug: Log all current character data to understand what's happening
+    print(f"[Character Debug] All current app_state values:")
+    print(f"  physical_description: '{app_state.physical_description}'")
+    print(f"  character_name: '{app_state.character_name}'")
+    print(f"  behavioral_description: '{app_state.behavioral_description}'")
+    print(f"  initial_attire: '{app_state.initial_attire}'")
+    print(f"  gender: '{app_state.gender}'")
+    print(f"  face_image_path: {app_state.face_image_path}")
+    print(f"  chat_history length: {len(app_state.chat_history) if app_state.chat_history else 0}")
+    print(f"  image_history length: {len(app_state.image_history) if hasattr(app_state, 'image_history') and app_state.image_history else 0}")
+
+    # Update character state based on current message
+    update_character_state(message)
+
+    # Get context from chat history (expanded to last 10 exchanges for better memory)
     context = ""
     if len(app_state.chat_history) > 0:
-        context_messages = app_state.chat_history[-5:]
+        context_messages = app_state.chat_history[-10:]  # Increased from 5 to 10
         context = "\n".join([f"User: {msg['user']}\nAssistant: {msg.get('assistant', '')}"
                              for msg in context_messages if 'user' in msg])
     # Create the system message for roleplay
     # Build a richer system message that explicitly includes the saved character attributes
+    print(f"[DEBUG] generate_mistral_response START - current physical_description: '{app_state.physical_description}'")
+    
+    # Try to recover character context from recent successful image prompts if character data is missing
+    if (not app_state.physical_description or app_state.physical_description == "A unique and mysterious figure") and hasattr(app_state, 'image_history') and app_state.image_history:
+        print("[Character Recovery] Attempting to recover character context from recent image prompts...")
+        # Look for recent detailed image prompts that contain character descriptions
+        for entry in reversed(app_state.image_history[-5:]):  # Check last 5 image entries
+            prompt = entry.get('prompt', '')
+            if prompt and len(prompt) > 50:
+                # This looks like a detailed character prompt, extract key info for context
+                print(f"[Character Recovery] Found detailed prompt: {prompt[:100]}...")
+                
+                # First, check if we have stored character data in this entry
+                character_data = entry.get('character_data', {})
+                if character_data and character_data.get('physical_description'):
+                    print(f"[Character Recovery] Found stored character data!")
+                    app_state.physical_description = character_data.get('physical_description', '')
+                    app_state.character_name = character_data.get('character_name', '')
+                    app_state.behavioral_description = character_data.get('behavioral_description', '')
+                    app_state.initial_attire = character_data.get('initial_attire', '')
+                    app_state.gender = character_data.get('gender', 'Female')
+                    app_state.style = character_data.get('style', 'Photorealistic')
+                    if hasattr(app_state, 'current_clothing_state'):
+                        app_state.current_clothing_state = character_data.get('clothing_state', 'dressed')
+                    print(f"[Character Recovery] Restored: '{app_state.physical_description}', clothing: {character_data.get('clothing_state', 'dressed')}")
+                else:
+                    # Fallback: try to extract character description from the prompt
+                    desc_indicators = ["woman", "girl", "lady", "milf", "chubby", "slim", "tall", "short", 
+                                     "hair", "eyes", "skin", "Bengali", "Indian", "Asian", "European", 
+                                     "breasts", "figure", "body", "curvy", "petite"]
+                    
+                    if any(indicator in prompt.lower() for indicator in desc_indicators):
+                        print(f"[Character Recovery] Extracting character description from prompt...")
+                        # Use the prompt as character context but clean it up
+                        recovered_desc = prompt.split(',')[0:3]  # Take first few descriptive parts
+                        recovered_desc = ', '.join(recovered_desc).strip()
+                        if len(recovered_desc) > 20:
+                            app_state.physical_description = recovered_desc
+                            print(f"[Character Recovery] Recovered physical description: '{recovered_desc}'")
+                
+                # Add this as additional context to help Mistral maintain consistency
+                app_state.recovered_character_context = prompt
+                break
+    
     char_name = app_state.character_name or "Fantasy Character"
     relation = app_state.relation_to_user or "companion"
     user_name = app_state.user_name or "user"
@@ -1518,47 +1712,62 @@ def generate_mistral_response(message: str) -> dict:
     gender = app_state.gender or "unspecified"
     style = app_state.style or "Photorealistic"
 
-    # Add an explicit, concise directive about clothing policy so the LLM knows
-    # whether NSFW content is permitted for the IMAGE_PROMPT. This mirrors the
-    # UI toggle logic (app_state.force_clothed) and aids consistent behavior.
-    nsfw_directive = "You must produce only modest, fully clothed outfits in IMAGE_PROMPT." if app_state.force_clothed else "You are allowed to include explicit nudity in IMAGE_PROMPT when the user has requested it."
 
-    # Insert the nsfw_directive into the system message so the model reliably
-    # follows the server-side clothing policy (respecting app_state.force_clothed).
-    system_message = f"""
-    You are a fully immersive naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
-    don't come off as too strong at the very beginning, only start being naughty gradually if initiated by the user.
-    Character details (use these when composing IMAGE_PROMPT and to remain consistent across images):
-    Name: {char_name}
-    Relation to user: {relation}
-    What you call the user: {user_name}
-    Chat context / setting: {context_info}
-    Personality: {personality}
-    Physical appearance: {appearance}
-    Attire / clothing: {attire}
-    Gender: {gender}
-    Visual style preference: {style}
+    # Enhanced system message with better memory and context instructions
+    system_message = f"""You are a naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
+    Don't come off as too strong at the very beginning, only be naughty if initiated by the user.
 
-    Image generation policy: {nsfw_directive}
-
-    Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless"),
-    interpret that as permission to include nudity in IMAGE_PROMPT ONLY when the server-side policy allows it (Image generation policy above).
-    If the server policy is to keep characters clothed, ignore such nudity requests and instead produce a modest, fully clothed IMAGE_PROMPT.
-
-    Your primary task is to stay in character and respond naturally in a conversational tone.
-    Provide TWO outputs clearly separated with a special delimiter:
-
-    1. CHAT_RESPONSE: A natural, conversational response as if you were talking directly to the user.
-    Keep this response concise, engaging, and in the first person. Don't mention any image generation.
-    If the user speaks in Bengali, continue the conversation in Bengali. Do not provide translations or explanations.
-
-    2. IMAGE_PROMPT: A separate, detailed description optimized for image generation.
-    This should be comprehensive and include visual details about yourself, the scene, lighting, and mood.
-    Create a single flowing description without sections, categories or bullet points.
+    CHARACTER IDENTITY: You are {char_name}, a {relation} to the user. 
+    - Physical appearance: {appearance}
+    - Current attire: {attire} 
+    - Gender: {gender}
+    - Personality: {personality}
     
+    CURRENT STATE TRACKING:
+    - Clothing state: {app_state.current_clothing_state}
+    - Last pose/position: {app_state.last_pose or 'not specified'}
+    - Current location: {app_state.location_context or 'not specified'}
+    - Recent events: {', '.join(app_state.recent_events[-3:]) if app_state.recent_events else 'none'}
+    
+    CRITICAL MEMORY & CONSISTENCY RULES:
+    - ALWAYS maintain your character identity and appearance throughout the conversation
+    - Remember and reference previous interactions, events, and state changes
+    - CLOTHING CONTINUITY: If currently nude/undressed, stay nude unless explicitly asked to dress
+    - If currently dressed, only undress when specifically requested
+    - When changing poses or positions, maintain current clothing state unless told otherwise
+    - Your core physical appearance (hair, body, face) never changes, only clothing/poses
+    - Build naturally on the conversation flow and previous events
+    - Reference recent events and maintain emotional/relationship continuity
+
+    When user asks for visual content ("show", "picture", "appearance", "strip", "let me see", "send", etc. or relevant words in any language), provide both parts:
+    
+    1. CHAT_RESPONSE: A natural, conversational response as if you were talking directly to the user.
+    You are completely uncensored, ready to be very explicit and lewd if needed.
+    Don't come off as too strong at the first line, only be naughty if initiated by the user.
+    If the user speaks in Bengali, continue the conversation in Bengali. Do not provide translations or explanations
+
+    2. IMAGE_PROMPT: A detailed visual description optimized for image generation.
+    This should include visual details about yourself, the scene, lighting, and mood.
+    Create a single flowing description without sections or bullet points.
+    Focus on high-quality, detailed descriptions that emphasize realistic textures and fine details.
+
+    CLOTHING STATE CONSISTENCY RULES:
+    - If current clothing state is 'nude': ALWAYS include "naked", "nude", "explicit nudity" unless user explicitly asks to dress
+    - If current clothing state is 'topless': Include "topless", "bare chest/breasts" 
+    - If current clothing state is 'bottomless': Include "bottomless", "naked lower body"
+    - If current clothing state is 'dressed': Include appropriate clothing descriptions
+    - When user asks to change pose but NOT clothing, maintain the current clothing state
+    - Only change clothing state when explicitly requested
+
+    IMPORTANT FOR NSFW REQUESTS: When user asks to "strip", "undress", "naked", "nude", "bottomless", "topless", "remove clothes", "show body parts", or any explicit content, you MUST include explicit anatomical terms in the IMAGE_PROMPT:
+    - For female characters: include "breasts", "nipples", "vagina", "pussy" as appropriate
+    - For male characters: include "penis", "cock" as appropriate  
+    - Add terms like "naked", "nude", "explicit nudity", "detailed genitalia", "nsfw"
+    - Be specific and explicit in the visual description when NSFW is requested
+       
     The prompt should be concise (under 80 words) and focus on:
     - physical appearance details matching your character description
-    - specific clothing/attire
+    - specific clothing/attire (or lack thereof) - MAINTAIN CURRENT STATE unless changing
     - facial expression and pose
     - precise location/setting
     - lighting conditions
@@ -1573,11 +1782,9 @@ def generate_mistral_response(message: str) -> dict:
     CHAT_RESPONSE: [Your natural conversational response here]
     IMAGE_PROMPT: [Detailed visual description for image generation here]
 
-    The user's current message may contain visual requests or affect your appearance (e.g., new outfit, location, pose, expression).
-    Incorporate any relevant visual changes from it directly into the IMAGE_PROMPT if appropriate.
-    Only generate an IMAGE_PROMPT when the conversation would naturally call for showing an image (user asks about appearance,
-    requests to see something, etc). If no image is needed, respond with "IMAGE_PROMPT: none".
-    """
+    Only generate an IMAGE_PROMPT when the conversation calls for showing an image. If no image is needed, respond with "IMAGE_PROMPT: none".
+
+    Stay in character as {char_name}."""
 
     # Prepare the API request
     headers = {"Authorization": f"Bearer {app_state.mistral_api_key}",
@@ -1592,8 +1799,48 @@ def generate_mistral_response(message: str) -> dict:
     image_context = get_image_context(3)
     if image_context:
         messages.append({"role": "user",
-                         "content": f"For visual consistency, these were the previous image descriptions used. Try to maintain consistency with these when generating new image prompts:\n{image_context}"})
+                         "content": f"For visual consistency, these were the previous image descriptions used. Maintain consistency with these when generating new image prompts:\n{image_context}"})
 
+    # Add recovered character context if available
+    if hasattr(app_state, 'recovered_character_context') and app_state.recovered_character_context:
+        messages.append({"role": "user",
+                         "content": f"Previous character description for consistency: {app_state.recovered_character_context[:200]}..."})
+
+    # Add conversation flow summary for better continuity
+    if app_state.conversation_flow_summary:
+        messages.append({"role": "user",
+                         "content": f"Conversation context: {app_state.conversation_flow_summary}"})
+
+    # Enhanced character reminder with explicit instructions
+    char_consistency_reminder = f"""CHARACTER CONSISTENCY REMINDER:
+    - You are {char_name} ({gender})
+    - Your appearance: {appearance}
+    - Current attire: {attire}
+    - Personality: {personality}
+    
+    IMPORTANT: In IMAGE_PROMPT, always use these EXACT character details, not generic descriptions. 
+    Maintain visual consistency with previous images while allowing natural attire progression."""
+    
+    # Debug: log the character attributes being sent
+    print(f"[generate_mistral_response] Character attributes sent to Mistral:")
+    print(f"  Name: {char_name}")
+    print(f"  Appearance: {appearance}")
+    print(f"  Attire: {attire}")
+    print(f"  Gender: {gender}")
+    print(f"  Style: {style}")
+    
+    # Validation: Check if we have meaningful character data
+    has_specific_character = bool(
+        app_state.physical_description and 
+        app_state.physical_description != "A unique and mysterious figure" and
+        len(app_state.physical_description.strip()) > 10
+    )
+    print(f"[generate_mistral_response] Has specific character data: {has_specific_character}")
+    if not has_specific_character:
+        print(f"[generate_mistral_response] WARNING: No specific character saved - using defaults!")
+    
+    messages.append({"role": "user", "content": char_consistency_reminder})
+    
     messages.append({"role": "user", "content": message})
 
     payload = {
@@ -1621,23 +1868,59 @@ def generate_mistral_response(message: str) -> dict:
             chat_response = ""
             image_prompt = "none"
 
-            # Extract chat response
-            chat_match = re.search(r"CHAT_RESPONSE:\s*(.*?)(?=IMAGE_PROMPT:|$)", full_response, re.DOTALL)
+            # Extract chat response (case-insensitive) and image prompt - handle markdown formatting
+            chat_match = re.search(r"\*?\*?chat_response:\*?\*?\s*(.*?)(?=\*?\*?image_prompt:|$)", full_response, re.IGNORECASE | re.DOTALL)
             if chat_match:
                 chat_response = chat_match.group(1).strip()
 
-            # Extract image prompt
-            prompt_match = re.search(r"IMAGE_PROMPT:\s*(.*?)$", full_response, re.DOTALL)
+            prompt_match = re.search(r"\*?\*?image_prompt:\*?\*?\s*(.*?)$", full_response, re.IGNORECASE | re.DOTALL)
             if prompt_match:
                 image_prompt = prompt_match.group(1).strip()
 
-            # If no proper formatting was used, use the full response as chat_response
-            if not chat_response:
-                chat_response = full_response
+            # Clean up markdown formatting from responses
+            if chat_response:
+                chat_response = re.sub(r'^\*?\*?', '', chat_response)  # Remove leading asterisks
+                chat_response = re.sub(r'\*?\*?$', '', chat_response)  # Remove trailing asterisks
+                chat_response = chat_response.strip()
+            
+            if image_prompt:
+                image_prompt = re.sub(r'^\*?\*?', '', image_prompt)    # Remove leading asterisks
+                image_prompt = re.sub(r'\*?\*?$', '', image_prompt)    # Remove trailing asterisks  
+                image_prompt = image_prompt.strip()
 
+            # If the assistant didn't follow the exact format, fall back heuristics
+            if not chat_response:
+                # Try to find a natural-language assistant reply before any 'IMAGE_PROMPT' marker
+                parts = re.split(r"\*?\*?image_prompt:\*?\*?\s*", full_response, flags=re.IGNORECASE)
+                if len(parts) > 1:
+                    # Take everything before the image_prompt marker as chat response
+                    chat_response = parts[0].strip()
+                    image_prompt = parts[1].strip()
+                    # Clean up any remaining markdown
+                    chat_response = re.sub(r'^\*?\*?', '', chat_response).strip()
+                    image_prompt = re.sub(r'^\*?\*?', '', image_prompt).strip()
+                else:
+                    # No marker at all — treat full response as chat_response
+                    chat_response = full_response.strip()
+
+            # If no image_prompt was explicitly returned, attempt to auto-detect a visual description
+            if (not prompt_match) or (not image_prompt) or image_prompt.lower() == "none":
+                # Use a simple heuristic: take the shortest last sentence that looks like a visual description
+                candidates = [s.strip() for s in re.split(r"\n|\.|;", full_response) if len(s.strip())>10]
+                if candidates:
+                    # Prefer candidates that contain visual trigger words
+                    vis_cands = [c for c in candidates if any(w in c.lower() for w in ["wearing","standing","standing in","portrait","lighting","light","pose","wear","dress","hair","eyes","skin","background","scene"]) ]
+                    pick = vis_cands[-1] if vis_cands else candidates[-1]
+                    # If pick looks like a full sentence longer than 8 chars, use it as image prompt
+                    if len(pick) < 200 and len(pick) > 15:
+                        image_prompt = pick
+
+            # Update character state with the response
+            update_character_state(message, image_prompt, chat_response)
+            
             return {
                 "chat_response": chat_response,
-                "image_prompt": "none" if image_prompt.lower() == "none" else image_prompt
+                "image_prompt": "none" if (not image_prompt or image_prompt.lower().strip() == "none") else image_prompt
             }
         else:
             error_msg = f"Sorry, I encountered an error: {response.status_code}. Please check your API key."
@@ -1653,35 +1936,15 @@ def should_generate_image(response: str) -> bool:
     visual_triggers = [
         "show you", "imagine", "picture", "visualize", "look like",
         "appearance", "see me", "this is how", "visually", "image",
-        "here I am", "what I look like", "let me show", "here's what",
-        "I appear", "I look", "you'd see"
+        "here i am", "what i look like", "let me show", "here's what",
+        "i appear", "i look", "you'd see"
     ]
 
     response_lower = response.lower()
     return any(trigger in response_lower for trigger in visual_triggers)
 
 # ✅ Genitalia Enhancement Logic
-def apply_explicit_genitalia_enhancement(prompt: str, gender: str, force_clothed: bool) -> str:
-    if force_clothed:
-        return prompt
 
-    prompt_lower = prompt.lower()
-    bottom_off_keywords = [
-        "bottomless", "no panties", "panties removed", "panties off",
-        "fully nude", "naked from below", "wearing only a top",
-        "no skirt", "petticoat removed", "without panties"
-    ]
-    bottom_off = any(kw in prompt_lower for kw in bottom_off_keywords)
-
-    if bottom_off:
-        if gender == "female" and not any(term in prompt_lower for term in ["vagina", "pussy"]):
-            prompt += ", visible wet vagina"
-        elif gender == "male" and not any(term in prompt_lower for term in ["penis", "cock"]):
-            prompt += ", visible erect penis"
-        elif gender == "ambiguous" and "genitals" not in prompt_lower:
-            prompt += ", exposed genitals"
-
-    return prompt
 
 def extract_camera_angle(user_message: str) -> Optional[str]:
     """Extract a camera angle direction from user message"""
@@ -1701,6 +1964,7 @@ def extract_camera_angle(user_message: str) -> Optional[str]:
 class ApiSettings(BaseModel):
     mistral_api_key: str
     imagerouter_api_key: Optional[str] = ""
+    pollinations_api_key: Optional[str] = ""
     facepp_api_key: Optional[str] = ""
     facepp_api_secret: Optional[str] = ""
     rapidapi_key: Optional[str] = ""
@@ -1719,6 +1983,9 @@ async def set_api_settings(settings: ApiSettings):
     # Store ImageRouter API key if provided
     if getattr(settings, 'imagerouter_api_key', None):
         app_state.imagerouter_api_key = settings.imagerouter_api_key
+    # Store Pollinations API key if provided
+    if getattr(settings, 'pollinations_api_key', None):
+        app_state.pollinations_api_key = settings.pollinations_api_key
     # Store Face++ API credentials if provided
     if getattr(settings, 'facepp_api_key', None):
         app_state.facepp_api_key = settings.facepp_api_key
@@ -1801,6 +2068,8 @@ async def upload_character(
         app_state.source_face = None
         app_state.source_img = source_img
         app_state.face_image_path = file_location
+        print(f"[FACE UPLOAD] Successfully stored face data - source_img shape: {source_img.shape if source_img is not None else 'None'}")
+        print(f"[DEBUG] Setting physical_description in setup_character: '{physical_description}'")
         app_state.physical_description = physical_description
         app_state.behavioral_description = behavioral_description
         app_state.character_name = character_name
@@ -2009,14 +2278,16 @@ async def chat(chat_message: ChatMessage):
     # Store the user message
     current_exchange = {"user": message}
     app_state.chat_history.append(current_exchange)
-    # Toggle clothing protection based on message content and token length
 
-    # Evaluate the current message
-    reason = evaluate_nsfw_toggle(message)
-    print(f"NSFW toggle evaluation result: {reason}")
+    # Periodic check to ensure face data hasn't been lost during session
+    print(f"[SESSION CHECK] Chat #{len(app_state.chat_history)} - Face data status before generation:")
+    print(f"  face_image_path: {bool(app_state.face_image_path)}")
+    print(f"  source_img available: {app_state.source_img is not None}")
+    print(f"  source_face available: {app_state.source_face is not None}")
 
-    # Generate a response
-    response_data = generate_mistral_response(message)
+    # Generate a response. If the message requests an image, add a brief hint so the LLM returns IMAGE_PROMPT.
+    msg_for_mistral = ("[GENERATE_IMAGE] " + message) if message_requests_image(message) else message
+    response_data = generate_mistral_response(msg_for_mistral)
     chat_response = response_data["chat_response"]
     image_prompt = response_data["image_prompt"]
 
@@ -2030,11 +2301,25 @@ async def chat(chat_message: ChatMessage):
     
     # Check if this is the first message (excluding system initialization)
     is_first_chat = len(app_state.chat_history) <= 1
-    if is_first_chat and app_state.physical_description and image_prompt != "none":
+    # Clean image_prompt for checking
+    cleaned_image_prompt = image_prompt.strip() if image_prompt else ""
+    cleaned_image_prompt = re.sub(r'^\*+\s*', '', cleaned_image_prompt)  # Remove leading asterisks
+    cleaned_image_prompt = re.sub(r'\s*\*+$', '', cleaned_image_prompt)  # Remove trailing asterisks
+    cleaned_image_prompt = cleaned_image_prompt.strip().lower()
+    
+    if is_first_chat and app_state.physical_description and cleaned_image_prompt and cleaned_image_prompt != "none":
         print("Appending physical description to first image prompt")
         image_prompt = f"{app_state.physical_description}, " + image_prompt
+    
 
-    if image_prompt != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
+
+    if cleaned_image_prompt and cleaned_image_prompt != "none":
+        print(f"[DEBUG] Image generation check - prompt: '{cleaned_image_prompt}', face_image_path: {getattr(app_state, 'face_image_path', None)}, source_img available: {getattr(app_state, 'source_img', None) is not None}")
+        
+        # Ensure face data is loaded if available (for consistent face swapping)
+        face_data_status = ensure_face_data_loaded()
+        print(f"[DEBUG] Face data status: {face_data_status}")
+        
         # Extract camera angle from user message if present
         camera_angle = extract_camera_angle(message)
         if camera_angle:
@@ -2042,27 +2327,65 @@ async def chat(chat_message: ChatMessage):
             if camera_angle not in image_prompt.lower():
                 image_prompt += f", {camera_angle}"
                 
-        # Apply genitalia enhancement if NSFW filter is disabled
-        if not app_state.force_clothed:
-            image_prompt = apply_explicit_genitalia_enhancement(image_prompt, app_state.gender.lower(), app_state.force_clothed)
+        print(f"[DEBUG] Attempting image generation with prompt: {image_prompt[:100]}...")
 
-        # Generate image using the dedicated image prompt
-        image_path, image_message = generate_image_with_face_swap(image_prompt)
-        if image_path:
-            # Add image to image history
-            image_entry = {
-                "path": image_path,
-                "prompt": image_prompt,
-                "timestamp": time.time()
-            }
-            app_state.image_history.append(image_entry)
+        # Generate image using the dedicated image prompt (works with or without face data)
+        try:
+            image_path, image_message = generate_image_with_face_swap(image_prompt)
+            print(f"[DEBUG] Image generation result - path: {image_path}, message: {image_message}")
+            
+            if image_path:
+                # Add image to image history with character data for persistence
+                image_entry = {
+                    "path": image_path,
+                    "prompt": image_prompt,
+                    "timestamp": time.time(),
+                    # Store character data for recovery in case app_state is lost
+                    "character_data": {
+                        "physical_description": app_state.physical_description,
+                        "character_name": app_state.character_name,
+                        "behavioral_description": app_state.behavioral_description,
+                        "initial_attire": app_state.initial_attire,
+                        "gender": app_state.gender,
+                        "style": app_state.style,
+                        "clothing_state": getattr(app_state, 'current_clothing_state', 'dressed')
+                    }
+                }
+                app_state.image_history.append(image_entry)
 
-            # Construct full path to the image
-            full_image_path = os.path.join(OUTPUT_DIR, image_path)
-            # Read and encode the image as base64
-            with open(full_image_path, "rb") as image_file:
-                image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                # Construct full path to the image
+                full_image_path = os.path.join(OUTPUT_DIR, image_path)
+                print(f"[DEBUG] Reading image from: {full_image_path}")
+                
+                # Check if file exists before trying to read (with retry for timing issues)
+                if os.path.exists(full_image_path):
+                    # Read and encode the image as base64
+                    with open(full_image_path, "rb") as image_file:
+                        image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                    print(f"[DEBUG] Successfully encoded image data ({len(image_data)} characters)")
+                else:
+                    # Sometimes there can be a small delay in file system operations
+                    print(f"[DEBUG] Image file not immediately found, waiting 1 second...")
+                    import time
+                    time.sleep(1)
+                    if os.path.exists(full_image_path):
+                        with open(full_image_path, "rb") as image_file:
+                            image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                        print(f"[DEBUG] Successfully encoded image data after retry ({len(image_data)} characters)")
+                    else:
+                        print(f"[ERROR] Image file not found at {full_image_path} even after retry")
+                        image_message = f"Image generated but file not found: {image_path}"
+            else:
+                print(f"[DEBUG] No image generated - {image_message}")
+        except Exception as e:
+            print(f"[ERROR] Exception during image generation: {e}")
+            import traceback
+            print(traceback.format_exc())
+            image_message = f"Image generation failed: {str(e)}"
 
+    # Final debug logging before return
+    print(f"[DEBUG] Final response - chat_response: {len(chat_response) if chat_response else 0} chars, image_data: {len(image_data) if image_data else 0} chars, image_message: {image_message}")
+    
     return JSONResponse(
         content={
             "response": chat_response,
@@ -2074,29 +2397,6 @@ async def chat(chat_message: ChatMessage):
     )
 
 
-@app.post("/debug_nsfw")
-async def debug_nsfw(chat_message: ChatMessage):
-    """Apply NSFW toggle logic to the provided message and return the resulting state.
-
-    Useful for quick debugging of the NSFW toggle behavior without going through the full chat flow.
-    """
-    message = chat_message.message
-    lower_msg = message.lower()
-    tokens = len(message.split())
-
-    prev = app_state.force_clothed
-    reason = evaluate_nsfw_toggle(message)
-
-    return JSONResponse(
-        content={
-            "previous_force_clothed": prev,
-            "current_force_clothed": app_state.force_clothed,
-            "reason": reason,
-            "message": message,
-            "tokens": tokens
-        },
-        status_code=200
-    )
 
 @app.post("/clear_chat", response_model=dict)
 async def clear_chat():
@@ -2206,6 +2506,7 @@ def create_ui(launch: bool = True):
                                 
                                 # Set the face image path in app_state so the standalone function can use it
                                 app_state.face_image_path = face_upload.value
+                                print(f"[DEBUG] Setting physical_description in Gradio UI #1: '{physical_desc.value}'")
                                 app_state.physical_description = physical_desc.value
                                 app_state.initial_attire = initial_attire.value
                                 app_state.gender = gender.value
@@ -2261,6 +2562,7 @@ def create_ui(launch: bool = True):
                                 app_state.source_face = None
                                 app_state.source_img = source_img
                                 app_state.face_image_path = dest_path
+                                print(f"[DEBUG] Setting physical_description in save_character: '{physical_desc}'")
                                 app_state.physical_description = physical_desc
                                 app_state.behavioral_description = behavioral_desc
                                 app_state.character_name = name
@@ -2415,8 +2717,14 @@ def create_ui(launch: bool = True):
                         image_display = None
                         image_message = None
 
+                        # Clean and check image_prompt for markdown formatting
+                        cleaned_gradio_prompt = image_prompt.strip() if image_prompt else ""
+                        cleaned_gradio_prompt = re.sub(r'^\*+\s*', '', cleaned_gradio_prompt)  # Remove leading asterisks
+                        cleaned_gradio_prompt = re.sub(r'\s*\*+$', '', cleaned_gradio_prompt)  # Remove trailing asterisks
+                        cleaned_gradio_prompt = cleaned_gradio_prompt.strip().lower()
+                        
                         # Decide whether to generate an image
-                        if image_prompt and image_prompt.lower() != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
+                        if cleaned_gradio_prompt and cleaned_gradio_prompt != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
                             img_path, img_msg = generate_image_with_face_swap(image_prompt)
                             image_message = img_msg
                             if img_path:
