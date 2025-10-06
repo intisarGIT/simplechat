@@ -317,18 +317,30 @@ def huggingface_face_swap(source_path, target_path, output_path):
         
         print(f"Hugging Face API result: {result}")
         
-        # Result should be a dict with 'path' key
+        # Handle different result formats from Hugging Face API
+        result_path = None
+        
+        # Case 1: Result is a dict with 'path' key
         if isinstance(result, dict) and 'path' in result:
             result_path = result['path']
-            if os.path.exists(result_path):
-                # Copy the result to our output path
-                shutil.copy(result_path, output_path)
-                print(f"Hugging Face face swap successful, saved to {output_path}")
-                return True
-            else:
-                print(f"Hugging Face result path does not exist: {result_path}")
-                return False
+        # Case 2: Result is a direct file path string 
+        elif isinstance(result, str) and result.startswith('/'):
+            result_path = result
+        # Case 3: Result is a dict but path might be in a different structure
+        elif isinstance(result, dict):
+            # Try common alternative keys
+            for key in ['file', 'output', 'image', 'result']:
+                if key in result and isinstance(result[key], str):
+                    result_path = result[key]
+                    break
+        
+        if result_path and os.path.exists(result_path):
+            # Copy the result to our output path
+            shutil.copy(result_path, output_path)
+            print(f"Hugging Face face swap successful, saved to {output_path}")
+            return True
         else:
+            print(f"Hugging Face result path not found or invalid: {result_path}")
             print(f"Unexpected Hugging Face result format: {result}")
             return False
             
