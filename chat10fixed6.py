@@ -2286,7 +2286,17 @@ async def chat(chat_message: ChatMessage):
         print("Appending physical description to first image prompt")
         image_prompt = f"{app_state.physical_description}, " + image_prompt
 
+    # Debug: Check character face status
+    print(f"=== CHARACTER FACE DEBUG ===")
+    print(f"face_image_path: {getattr(app_state, 'face_image_path', 'NOT SET')}")
+    print(f"source_img: {'SET' if getattr(app_state, 'source_img', None) is not None else 'NOT SET'}")
+    print(f"character_name: {getattr(app_state, 'character_name', 'NOT SET')}")
+    print(f"physical_description: {getattr(app_state, 'physical_description', 'NOT SET')}")
+    print(f"============================")
+
     if image_prompt != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
+        print(f"✅ CONDITION MET: Starting image generation with prompt: {image_prompt}")
+        
         # Extract camera angle from user message if present
         camera_angle = extract_camera_angle(message)
         if camera_angle:
@@ -2301,6 +2311,7 @@ async def chat(chat_message: ChatMessage):
         # Generate image using the dedicated image prompt
         image_path, image_message = generate_image_with_face_swap(image_prompt)
         if image_path:
+            print(f"✅ IMAGE GENERATED: {image_path}")
             # Add image to image history
             image_entry = {
                 "path": image_path,
@@ -2314,6 +2325,13 @@ async def chat(chat_message: ChatMessage):
             # Read and encode the image as base64
             with open(full_image_path, "rb") as image_file:
                 image_data = base64.b64encode(image_file.read()).decode('utf-8')
+        else:
+            print(f"❌ IMAGE GENERATION FAILED: {image_message}")
+    elif image_prompt == "none":
+        print("❌ NO IMAGE: Mistral returned IMAGE_PROMPT: none")
+    else:
+        print("❌ NO CHARACTER FACE: Cannot generate image without uploaded character face")
+        print("   - Please upload and save a character face in the Setup tab")
 
     return JSONResponse(
         content={
