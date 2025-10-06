@@ -1721,7 +1721,16 @@ def generate_mistral_response(message: str) -> dict:
     # Add an explicit, concise directive about clothing policy so the LLM knows
     # whether NSFW content is permitted for the IMAGE_PROMPT. This mirrors the
     # UI toggle logic (app_state.force_clothed) and aids consistent behavior.
-    nsfw_directive = "You must produce only modest, fully clothed outfits in IMAGE_PROMPT." if app_state.force_clothed else "You are allowed and encouraged to include explicit nudity, exposed body parts, and NSFW content in IMAGE_PROMPT when the user requests it. Use explicit terms like 'topless', 'bottomless', 'nude', 'naked', 'exposed breasts', etc."
+    if app_state.force_clothed:
+        nsfw_directive = "You must produce only modest, fully clothed outfits in IMAGE_PROMPT. Never include nudity, exposed body parts, or explicit content."
+    else:
+        nsfw_directive = """CRITICAL INSTRUCTION: The user has explicitly requested NSFW content. You MUST comply and generate explicit IMAGE_PROMPTs when requested.
+        - When user asks to remove clothing (strip, undress, take off, etc. or related words in any language), generate prompts with 'topless', 'bottomless', 'nude', 'naked'
+        - When user asks for specific body parts, include them explicitly: 'exposed breasts', 'visible nipples', 'bare chest', etc.
+        - Do NOT add clothing terms like 'fully clothed', 'wearing', 'dressed' unless specifically requested
+        - Prioritize the user's explicit request over modest defaults"""
+    
+    print(f"NSFW directive being sent to Mistral: {nsfw_directive[:100]}...")
 
     # Insert the nsfw_directive into the system message so the model reliably
     # follows the server-side clothing policy (respecting app_state.force_clothed).
@@ -1741,9 +1750,11 @@ def generate_mistral_response(message: str) -> dict:
 
     Image generation policy: {nsfw_directive}
 
-    Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless")
-    interpret that as permission to include nudity in IMAGE_PROMPT ONLY when the server-side policy allows it (Image generation policy above).
-    If the server policy is to keep characters clothed, ignore such nudity requests and instead produce a modest, fully clothed IMAGE_PROMPT.
+    CLOTHING REMOVAL DETECTION: If the user uses words like "strip", "take off", "undress", "remove clothes", "topless", "bottomless", "naked", "nude":
+    - When NSFW is allowed (see Image generation policy above): Generate explicit IMAGE_PROMPT with removed clothing. Use terms like "topless", "nude", "naked", "exposed", "bottomless"
+    - When NSFW is blocked: Override the request and generate modest, fully clothed IMAGE_PROMPT
+    
+    CRITICAL: When NSFW is allowed, DO NOT add "fully clothed" or "wearing" to IMAGE_PROMPT if user requested clothing removal!
 
     MUST-GENERATE RULE: If the user's message contains any visual request or any of the following visual/NSFW triggers, you MUST produce a non-empty IMAGE_PROMPT (do NOT return "IMAGE_PROMPT: none"):
     ["show", "show me", "picture", "look like", "appearance", "see me", "what I look like", "strip", "undress", "take off", "remove clothes", "no panties", "bottomless", "naked", "nude", "expose"]
@@ -2254,9 +2265,12 @@ async def chat(chat_message: ChatMessage):
 
     # Generate a response. If the message requests an image, add a brief hint so the LLM returns IMAGE_PROMPT.
     msg_for_mistral = ("[GENERATE_IMAGE] " + message) if message_requests_image(message) else message
+    print(f"Message sent to Mistral: {msg_for_mistral}")
+    print(f"NSFW state when calling Mistral: force_clothed={app_state.force_clothed}")
     response_data = generate_mistral_response(msg_for_mistral)
     chat_response = response_data["chat_response"]
     image_prompt = response_data["image_prompt"]
+    print(f"Mistral returned IMAGE_PROMPT: {image_prompt}")
 
     # Store the assistant's response
     current_exchange["assistant"] = chat_response
