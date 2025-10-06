@@ -110,6 +110,8 @@ class AppState:
         self.rapidapi_host = os.getenv("RAPIDAPI_HOST", "faceswap-image-transformation-api-free-api-face-swap.p.rapidapi.com")
         # Mistral API Key (use MISTRAL_API_KEY env var)
         self.mistral_api_key = os.getenv("MISTRAL_API_KEY", "")
+        # Hugging Face token for private spaces (use HUGGINGFACE_TOKEN env var)
+        self.huggingface_token = os.getenv("HUGGINGFACE_TOKEN", "")
     
 
 
@@ -293,8 +295,16 @@ def huggingface_face_swap(source_path, target_path, output_path):
             
         print("Attempting Hugging Face face swap fallback...")
         
-        # Initialize client
-        client = Client("intisarhasnain/face-swap2")
+        # Get authentication token for private spaces
+        hf_token = app_state.huggingface_token or os.getenv("HUGGINGFACE_TOKEN", "")
+        
+        # Initialize client with authentication if token is provided
+        if hf_token:
+            print("Using authenticated Hugging Face client (private space)")
+            client = Client("intisarhasnain/face-swap2", hf_token=hf_token)
+        else:
+            print("Using public Hugging Face client (no authentication)")
+            client = Client("intisarhasnain/face-swap2")
         
         # Call the prediction API
         result = client.predict(
