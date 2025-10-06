@@ -1745,8 +1745,14 @@ def generate_mistral_response(message: str) -> dict:
     Gender: {gender}
     Visual style preference: {style}
 
-    MANDATORY RULE: When generating IMAGE_PROMPT, you MUST include the exact physical appearance "{appearance}" and attire "{attire}" details. 
-    DO NOT substitute with generic descriptions. Use these saved character details verbatim.
+    MANDATORY RULE: When generating IMAGE_PROMPT, you MUST include the exact physical appearance "{appearance}" details. 
+    DO NOT substitute with generic descriptions for physical features. Use the saved physical appearance verbatim.
+    
+    ATTIRE RULE: Use "{attire}" as the default clothing, but you may change attire if:
+    - User explicitly requests clothing changes ("take off", "change into", "wearing", etc.)
+    - Conversation naturally progresses to different outfits or undressing
+    - NSFW content is permitted and user requests nudity
+    Always maintain the physical appearance "{appearance}" regardless of attire changes.
 
     Image generation policy: {nsfw_directive}
 
@@ -1821,7 +1827,9 @@ def generate_mistral_response(message: str) -> dict:
         f"Gender: {gender}\n"
         f"Visual style: {style}\n\n"
         f"FORBIDDEN: Do NOT use generic terms like 'mysterious woman', 'beautiful woman', 'attractive person' or any vague descriptions. "
-        f"Use the EXACT appearance details: '{appearance}' and attire: '{attire}' in your IMAGE_PROMPT."
+        f"MANDATORY: Always use the EXACT physical appearance details: '{appearance}' in your IMAGE_PROMPT. "
+        f"ATTIRE FLEXIBILITY: Use '{attire}' as the default clothing, but if the user requests clothing changes (undressing, changing outfits, etc.), "
+        f"you may modify the attire accordingly while keeping the physical appearance '{appearance}' unchanged."
     )
     
     # Debug: log the character attributes being sent
