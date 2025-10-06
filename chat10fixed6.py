@@ -340,13 +340,10 @@ def huggingface_face_swap(source_path, target_path, output_path):
 
 
 def swap_face(source_face, source_img, target_path, output_path):
-    """Swap face using Face++ Merge API, fallback to local insightface method on failure."""
+    """Swap face using RapidAPI, fallback to Hugging Face Spaces API on failure."""
     try:
-        # Prepare Face++ credentials
-        api_key = app_state.facepp_api_key or os.getenv("FACEPP_API_KEY", "")
-        api_secret = app_state.facepp_api_secret or os.getenv("FACEPP_API_SECRET", "")
-        if not api_key or not api_secret:
-            raise RuntimeError("Face++ API credentials not configured")
+        # We no longer need Face++ credentials - remove this check
+        # The function now uses RapidAPI as primary and Hugging Face as fallback
 
         # Ensure target image exists
         if not os.path.exists(target_path):
@@ -910,195 +907,30 @@ def swap_face(source_face, source_img, target_path, output_path):
                     print(f"RapidAPI faceswap attempt failed with exception: {e}")
 
         except Exception:
-            # non-fatal - continue to Face++
+            # non-fatal - RapidAPI failed, continue to Hugging Face fallback
             pass
 
-        # Face++ expects a two-step flow in practice: detect (to get face_token) or
-        # supply a template_file/merge_file directly. We'll call detect on the
-        # template image to obtain a template_face_token and then call mergeface
-        # with that face token plus the merge_file. This often yields more
-        # reliable results than relying on auto-detection server-side.
-
-        # Regional endpoints (US then CN)
-        detect_endpoints = [
-            "https://api-us.faceplusplus.com/facepp/v3/detect",
-            "https://api-cn.faceplusplus.com/facepp/v3/detect"
-        ]
-        merge_endpoints = [
-            "https://api-us.faceplusplus.com/facepp/v1/mergeface",
-            "https://api-cn.faceplusplus.com/facepp/v1/mergeface"
-        ]
-
-        # Detect faces in both images so we can pass correct rectangles.
-        detect_last_err = None
-        jd_user = None
-        jd_generated = None
-
-        # Detect on user-uploaded face (template_path variable currently points to the uploaded face)
-        for detect_url in detect_endpoints:
-            try:
-                print(f"Attempting Face++ detect (user face) at {detect_url}")
-                with open(template_path, 'rb') as tf:
-                    files = {'image_file': tf}
-                    data = {'api_key': api_key, 'api_secret': api_secret}
-                    resp = requests.post(detect_url, data=data, files=files, timeout=30)
-                if resp.status_code == 200:
-                    jd_user = resp.json()
-                    faces = jd_user.get('faces', [])
-                    if faces:
-                        print(f"Detected {len(faces)} face(s) in user image")
-                        break
-                    else:
-                        detect_last_err = (resp.status_code, 'no faces detected in user image')
-                        print(f"Detect succeeded but no faces found in user image: {jd_user}")
-                        break
-                else:
-                    detect_last_err = (resp.status_code, resp.text)
-                    print(f"Detect(user) returned {resp.status_code}: {resp.text}")
-                    if resp.status_code == 401:
-                        raise RuntimeError(f"Face++ authentication error (detect user): {resp.status_code} {resp.text}")
-                    continue
-            except Exception as e:
-                detect_last_err = (None, str(e))
-                print(f"Face++ detect error (user) at {detect_url}: {e}")
-                continue
-
-        # Detect on generated target image (merge_image_path points to generated image)
-        for detect_url in detect_endpoints:
-            try:
-                print(f"Attempting Face++ detect (generated image) at {detect_url}")
-                with open(merge_image_path, 'rb') as tf:
-                    files = {'image_file': tf}
-                    data = {'api_key': api_key, 'api_secret': api_secret}
-                    resp = requests.post(detect_url, data=data, files=files, timeout=30)
-                if resp.status_code == 200:
-                    jd_generated = resp.json()
-                    faces = jd_generated.get('faces', [])
-                    if faces:
-                        print(f"Detected {len(faces)} face(s) in generated image")
-                        break
-                    else:
-                        detect_last_err = (resp.status_code, 'no faces detected in generated image')
-                        print(f"Detect succeeded but no faces found in generated image: {jd_generated}")
-                        break
-                else:
-                    detect_last_err = (resp.status_code, resp.text)
-                    print(f"Detect(generated) returned {resp.status_code}: {resp.text}")
-                    if resp.status_code == 401:
-                        raise RuntimeError(f"Face++ authentication error (detect generated): {resp.status_code} {resp.text}")
-                    continue
-            except Exception as e:
-                detect_last_err = (None, str(e))
-                print(f"Face++ detect error (generated) at {detect_url}: {e}")
-                continue
-        # 2) Call Merge Face API using template_file + merge_file and template_rectangle per docs.
-        # Use the imagepp merge endpoint path (note: path is /imagepp/v1/mergeface).
-        merge_last_err = None
-        merge_resp = None
-
-        # Build template_rectangle (where on the template image the face is) and
-        # merge_rectangle (the face area within the merging image) using detected faces.
-        template_rectangle = None
-        merge_rectangle = None
-
-        try:
-            if jd_generated and jd_generated.get('faces'):
-                fr = jd_generated['faces'][0].get('face_rectangle')
-                if fr:
-                    template_rectangle = f"{fr.get('top')},{fr.get('left')},{fr.get('width')},{fr.get('height')}"
-                    print(f"Using template_rectangle from generated image: {template_rectangle}")
-        except Exception:
-            template_rectangle = None
-
-        try:
-            if jd_user and jd_user.get('faces'):
-                fr2 = jd_user['faces'][0].get('face_rectangle')
-                if fr2:
-                    merge_rectangle = f"{fr2.get('top')},{fr2.get('left')},{fr2.get('width')},{fr2.get('height')}"
-                    print(f"Using merge_rectangle from user image: {merge_rectangle}")
-        except Exception:
-            merge_rectangle = None
-
-        # Build merge endpoints using imagepp path (US then CN)
-        merge_endpoints = [
-            "https://api-us.faceplusplus.com/imagepp/v1/mergeface",
-            "https://api-cn.faceplusplus.com/imagepp/v1/mergeface"
-        ]
-
-        for merge_url in merge_endpoints:
-            try:
-                print(f"Attempting Face++ merge at {merge_url}")
-                # IMPORTANT: per Face++ docs, the template image is the background image
-                # and the merge image supplies the facial features to be applied.
-                # We want the generated image (merge_image_path) to be the template
-                # and the user's uploaded face (template_path) to be the merging image.
-                with open(merge_image_path, 'rb') as tf, open(template_path, 'rb') as mf:
-                    files = {
-                        'template_file': tf,   # generated image as template (background)
-                        'merge_file': mf       # user face as merging source (facial features)
-                    }
-                    # Merge tuning: make the merged image strongly reflect the merging image
-                    # as requested by the user. Set merge_rate high and feature_rate low.
-                    data = {
-                        'api_key': api_key,
-                        'api_secret': api_secret,
-                        'merge_rate': 100,
-                        'feature_rate': 0
-                    }
-                    if template_rectangle:
-                        data['template_rectangle'] = template_rectangle
-                    if merge_rectangle:
-                        data['merge_rectangle'] = merge_rectangle
-
-                    print(f"Face++ merge parameters: merge_rate={data.get('merge_rate')} feature_rate={data.get('feature_rate')}")
-
-                    resp = requests.post(merge_url, data=data, files=files, timeout=60)
-
-                merge_resp = resp
-                if merge_resp.status_code == 200:
-                    break
-
-                merge_last_err = (merge_resp.status_code, merge_resp.text)
-                print(f"Merge returned {merge_resp.status_code}: {merge_resp.text}")
-                if merge_resp.status_code == 401:
-                    # authentication error - stop trying other endpoints and surface helpful message
-                    raise RuntimeError(f"Face++ authentication error (merge): {merge_resp.status_code} {merge_resp.text}")
-                if merge_resp.status_code == 404:
-                    print(f"Endpoint {merge_url} returned 404 — trying next endpoint if available")
-                    continue
-                else:
-                    continue
-            except Exception as e:
-                merge_last_err = (None, str(e))
-                print(f"Face++ merge error at {merge_url}: {e}")
-                continue
-
-        if merge_resp is None:
-            raise RuntimeError(f"Face++ detect/merge failed: detect_err={detect_last_err} merge_err={merge_last_err}")
-
-        if merge_resp.status_code != 200:
-            # Provide actionable guidance for auth errors
-            if merge_resp.status_code == 401:
-                raise RuntimeError(f"Face++ API authentication error during merge: {merge_resp.status_code} {merge_resp.text}. Please verify your API key/secret and region (US vs CN) and ensure Merge API access is enabled for your account.")
-            raise RuntimeError(f"Face++ API error: {merge_resp.status_code} {merge_resp.text}")
-
-        result = merge_resp.json()
-        # Face++ merge returns a base64 'result' field on success
-        if 'result' in result and isinstance(result['result'], str):
-            img_bytes = base64.b64decode(result['result'])
-            with open(output_path, 'wb') as out_f:
-                out_f.write(img_bytes)
+        # RapidAPI failed, try Hugging Face fallback directly
+        print("RapidAPI failed, attempting Hugging Face fallback...")
+        if huggingface_face_swap(template_path, target_path, output_path):
+            print("Hugging Face fallback succeeded")
             return output_path
         else:
-            raise RuntimeError(f"Unexpected Face++ merge response format: {result}")
+            print("Hugging Face fallback also failed, returning original image")
+            # If all face swap methods fail, return the original target image
+            try:
+                shutil.copy(target_path, output_path)
+                return output_path
+            except Exception:
+                return None
 
     except Exception as e:
-        print(f"Face++ merge failed: {e}")
+        print(f"Face swap failed: {e}")
         import traceback
         print(traceback.format_exc())
         
-        # Try Hugging Face fallback before giving up
-        print("Attempting Hugging Face fallback...")
+        # Try Hugging Face fallback as last resort
+        print("Attempting Hugging Face fallback as last resort...")
         if huggingface_face_swap(template_path, target_path, output_path):
             print("Hugging Face fallback succeeded")
             return output_path
@@ -1144,6 +976,9 @@ def detect_gender_from_description(description):
             return "male"
         else:
             return "unknown"
+
+
+
 
 
 def detect_face_gender(face):
@@ -1654,10 +1489,16 @@ def generate_mistral_response(message: str) -> dict:
     2. IMAGE_PROMPT: A detailed visual description optimized for image generation.
     This should include visual details about yourself, the scene, lighting, and mood.
     Create a single flowing description without sections or bullet points.
+
+    IMPORTANT FOR NSFW REQUESTS: When user asks to "strip", "undress", "naked", "nude", "bottomless", "topless", "remove clothes", "show body parts", or any explicit content, you MUST include explicit anatomical terms in the IMAGE_PROMPT:
+    - For female characters: include "breasts", "nipples", "vagina", "pussy" as appropriate
+    - For male characters: include "penis", "cock" as appropriate  
+    - Add terms like "naked", "nude", "explicit nudity", "detailed genitalia", "nsfw"
+    - Be specific and explicit in the visual description when NSFW is requested
        
     The prompt should be concise (under 80 words) and focus on:
     - physical appearance details matching your character description
-    - specific clothing/attire
+    - specific clothing/attire (or lack thereof for NSFW)
     - facial expression and pose
     - precise location/setting
     - lighting conditions
@@ -2143,7 +1984,6 @@ async def chat(chat_message: ChatMessage):
     # Store the user message
     current_exchange = {"user": message}
     app_state.chat_history.append(current_exchange)
-    # Toggle clothing protection based on message content and token length
 
     # Generate a response. If the message requests an image, add a brief hint so the LLM returns IMAGE_PROMPT.
     msg_for_mistral = ("[GENERATE_IMAGE] " + message) if message_requests_image(message) else message
@@ -2170,6 +2010,8 @@ async def chat(chat_message: ChatMessage):
     if is_first_chat and app_state.physical_description and cleaned_image_prompt and cleaned_image_prompt != "none":
         print("Appending physical description to first image prompt")
         image_prompt = f"{app_state.physical_description}, " + image_prompt
+    
+
 
     if cleaned_image_prompt and cleaned_image_prompt != "none" and (getattr(app_state, 'face_image_path', None) or getattr(app_state, 'source_img', None)):
         # Extract camera angle from user message if present
