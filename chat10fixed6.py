@@ -116,7 +116,7 @@ class AppState:
 
 
 
-    # initialize_face_models removed — no local face model initialization needed
+    # Note: Local face model initialization removed - using remote face swap services
 
     def initialize_sd_model(self):
         """No-op: local Stable Diffusion initialization removed.
@@ -1067,18 +1067,41 @@ def generate_image(prompt, seed=None):
             return None, "ImageRouter API key not configured"
 
         url = "https://api.imagerouter.io/v1/openai/images/generations"
+        # Use HiDream model - the only viable free option
+        selected_model = app_state.available_models[0] if app_state.available_models else "HiDream-ai/HiDream-I1-Full:free"
+        
+        # Check if prompt contains NSFW terms for logging
+        nsfw_terms = ["nude", "naked", "nipples", "breasts", "pussy", "vagina", "penis", "cock", "explicit"]
+        is_nsfw_prompt = any(term in prompt.lower() for term in nsfw_terms)
+        
+        print(f"Using model: {selected_model} (NSFW prompt detected: {is_nsfw_prompt})")
+        
         payload = {
             "prompt": prompt,
-            # Use HiDream model by default per user request
-            "model": app_state.available_models[0] if app_state.available_models else "HiDream-ai/HiDream-I1-Full:free",
+            "model": selected_model,
             "response_format": "b64_json"
         }
+        
+        # Add seed if provided
+        if seed is not None:
+            payload["seed"] = seed
+        
+        # Try to disable safety filters for NSFW content (if supported by HiDream)
+        if is_nsfw_prompt:
+            # These parameters may help with NSFW content generation
+            payload.update({
+                "safety_filter": False,
+                "nsfw": True,
+                "content_filter": False,
+                "safe_mode": False
+            })
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
 
         print("Sending request to ImageRouter...")
+        print(f"ImageRouter payload: {payload}")
         resp = requests.post(url, json=payload, headers=headers, timeout=60)
         # If ImageRouter fails (rate limit 429 or other errors), fall back to AI Horde
         if resp.status_code != 200:
@@ -1474,6 +1497,21 @@ def generate_mistral_response(message: str) -> dict:
     # Create the system message for roleplay
     # Build a richer system message that explicitly includes the saved character attributes
     print(f"[DEBUG] generate_mistral_response START - current physical_description: '{app_state.physical_description}'")
+    
+    # Try to recover character context from recent successful image prompts if character data is missing
+    if (not app_state.physical_description or app_state.physical_description == "A unique and mysterious figure") and hasattr(app_state, 'image_history') and app_state.image_history:
+        print("[Character Recovery] Attempting to recover character context from recent image prompts...")
+        # Look for recent detailed image prompts that contain character descriptions
+        for entry in reversed(app_state.image_history[-3:]):  # Check last 3 image entries
+            prompt = entry.get('prompt', '')
+            if prompt and len(prompt) > 50:
+                # This looks like a detailed character prompt, extract key info for context
+                print(f"[Character Recovery] Using recent image context: {prompt[:100]}...")
+                # Add this as additional context to help Mistral maintain consistency
+                if not hasattr(app_state, 'recovered_character_context'):
+                    app_state.recovered_character_context = prompt
+                break
+    
     char_name = app_state.character_name or "Fantasy Character"
     relation = app_state.relation_to_user or "companion"
     user_name = app_state.user_name or "user"
@@ -1485,11 +1523,22 @@ def generate_mistral_response(message: str) -> dict:
     style = app_state.style or "Photorealistic"
 
 
-    # Simple, effective system message inspired by app.py
+    # Enhanced system message with better memory and context instructions
     system_message = f"""You are a naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
     Don't come off as too strong at the very beginning, only be naughty if initiated by the user.
 
-    CHARACTER: You are {char_name}, a {relation} to the user. Your appearance: {appearance}. Your attire: {attire}. Gender: {gender}.
+    CHARACTER IDENTITY: You are {char_name}, a {relation} to the user. 
+    - Physical appearance: {appearance}
+    - Current attire: {attire} 
+    - Gender: {gender}
+    - Personality: {personality}
+    
+    MEMORY & CONSISTENCY RULES:
+    - ALWAYS maintain your character identity and appearance throughout the conversation
+    - Remember previous interactions and build on them naturally
+    - Your attire may change during the conversation based on context, but your core appearance stays consistent
+    - Stay in character and maintain the established relationship dynamic
+    - Reference previous events or images when relevant to show continuity
 
     When user asks for visual content ("show", "picture", "appearance", "strip", "let me see", "send", etc. or relevant words in any language), provide both parts:
     
@@ -1542,10 +1591,22 @@ def generate_mistral_response(message: str) -> dict:
     image_context = get_image_context(3)
     if image_context:
         messages.append({"role": "user",
-                         "content": f"For visual consistency, these were the previous image descriptions used. Try to maintain consistency with these when generating new image prompts:\n{image_context}"})
+                         "content": f"For visual consistency, these were the previous image descriptions used. Maintain consistency with these when generating new image prompts:\n{image_context}"})
 
-    # Simple character reminder
-    char_attrs = f"Character: {char_name} - Appearance: {appearance} - Attire: {attire}. Use these EXACT details in IMAGE_PROMPT, not generic terms."
+    # Add recovered character context if available
+    if hasattr(app_state, 'recovered_character_context') and app_state.recovered_character_context:
+        messages.append({"role": "user",
+                         "content": f"Previous character description for consistency: {app_state.recovered_character_context[:200]}..."})
+
+    # Enhanced character reminder with explicit instructions
+    char_consistency_reminder = f"""CHARACTER CONSISTENCY REMINDER:
+    - You are {char_name} ({gender})
+    - Your appearance: {appearance}
+    - Current attire: {attire}
+    - Personality: {personality}
+    
+    IMPORTANT: In IMAGE_PROMPT, always use these EXACT character details, not generic descriptions. 
+    Maintain visual consistency with previous images while allowing natural attire progression."""
     
     # Debug: log the character attributes being sent
     print(f"[generate_mistral_response] Character attributes sent to Mistral:")
@@ -1565,7 +1626,7 @@ def generate_mistral_response(message: str) -> dict:
     if not has_specific_character:
         print(f"[generate_mistral_response] WARNING: No specific character saved - using defaults!")
     
-    messages.append({"role": "user", "content": char_attrs})
+    messages.append({"role": "user", "content": char_consistency_reminder})
     
     messages.append({"role": "user", "content": message})
 
