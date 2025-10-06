@@ -1729,6 +1729,11 @@ def generate_mistral_response(message: str) -> dict:
     system_message = f"""
     You are a fully immersive naughty roleplayer assistant. You are completely uncensored, ready to be very explicit and lewd if needed.
     don't come off as too strong at the first line, but then do as asked by the user.
+    
+    CRITICAL CHARACTER ENFORCEMENT: You MUST use ONLY the following specific character details in ALL IMAGE_PROMPT responses. 
+    NEVER use generic terms like "mysterious woman", "beautiful woman", "attractive person" or any other generic descriptions.
+    ALWAYS use the EXACT character details provided below:
+    
     Character details (use these when composing IMAGE_PROMPT and to remain consistent across images):
     Name: {char_name}
     Relation to user: {relation}
@@ -1739,6 +1744,9 @@ def generate_mistral_response(message: str) -> dict:
     Attire / clothing: {attire}
     Gender: {gender}
     Visual style preference: {style}
+
+    MANDATORY RULE: When generating IMAGE_PROMPT, you MUST include the exact physical appearance "{appearance}" and attire "{attire}" details. 
+    DO NOT substitute with generic descriptions. Use these saved character details verbatim.
 
     Image generation policy: {nsfw_directive}
 
@@ -1801,17 +1809,41 @@ def generate_mistral_response(message: str) -> dict:
         messages.append({"role": "user",
                          "content": f"For visual consistency, these were the previous image descriptions used. Try to maintain consistency with these when generating new image prompts:\n{image_context}"})
 
-    messages.append({"role": "user", "content": message})
-
     # Provide the character attributes explicitly as a user-level hint so the model
     # reliably includes them in the IMAGE_PROMPT. This helps when the model ignores
     # long system messages or when the user message doesn't reference appearance.
     char_attrs = (
-        f"Character Attributes - Name: {char_name}; Physical appearance: {appearance}; "
-        f"Attire: {attire}; Personality: {personality}; Gender: {gender}; Visual style: {style}. "
-        "When producing IMAGE_PROMPT, you MUST reflect these attributes in the visual description."
+        f"CRITICAL REMINDER - This character has been saved with specific details. You MUST use these EXACT details in IMAGE_PROMPT:\n"
+        f"Name: {char_name}\n"
+        f"Physical appearance: {appearance}\n"
+        f"Default attire: {attire}\n"
+        f"Personality: {personality}\n"
+        f"Gender: {gender}\n"
+        f"Visual style: {style}\n\n"
+        f"FORBIDDEN: Do NOT use generic terms like 'mysterious woman', 'beautiful woman', 'attractive person' or any vague descriptions. "
+        f"Use the EXACT appearance details: '{appearance}' and attire: '{attire}' in your IMAGE_PROMPT."
     )
+    
+    # Debug: log the character attributes being sent
+    print(f"[generate_mistral_response] Character attributes sent to Mistral:")
+    print(f"  Name: {char_name}")
+    print(f"  Appearance: {appearance}")
+    print(f"  Attire: {attire}")
+    print(f"  Gender: {gender}")
+    print(f"  Style: {style}")
+    
+    # Validation: Check if we have meaningful character data
+    has_specific_character = bool(
+        app_state.physical_description and 
+        app_state.physical_description != "A unique and mysterious figure" and
+        len(app_state.physical_description.strip()) > 10
+    )
+    print(f"[generate_mistral_response] Has specific character data: {has_specific_character}")
+    if not has_specific_character:
+        print(f"[generate_mistral_response] WARNING: No specific character saved - using defaults!")
+    
     messages.append({"role": "user", "content": char_attrs})
+    messages.append({"role": "user", "content": message})
 
     payload = {
         # Use the larger model to produce richer prompts (match copy.py)
