@@ -206,81 +206,42 @@ app_state = AppState()
 
 
 def evaluate_nsfw_toggle(msg: str):
-    """Evaluate msg and update app_state.force_clothed.
-
-    Returns a short reason string describing what occurred.
-    """
-    # Use whole-word regex matching to avoid substring false positives.
+    """Simple NSFW toggle - no complex negation logic, just direct pattern matching."""
     text = (msg or "").lower()
-    tokens = len(text.split())
-
-    # Explicit command patterns — these should always take precedence
-    # explicit_disable = patterns that DISABLE the filter (allow NSFW content)
-    # explicit_enable = patterns that ENABLE the filter (block NSFW content) 
-    explicit_disable = [r"\bdisable filter\b", r"\bturn off filter\b", r"\bno filter\b", r"\benable nsfw\b", r"\ballow nsfw\b"]
-    explicit_enable = [r"\benable filter\b", r"\bturn on filter\b", r"\bactivate filter\b", r"\bdisable nsfw\b"]
-
-    # Debug: log incoming message
     print(f"[nsfw-toggle] evaluating message: {msg!r}")
-    for pat in explicit_disable:
-        if re.search(pat, text):
+
+    # Explicit commands - highest priority
+    if any(cmd in text for cmd in ["enable nsfw", "allow nsfw", "disable filter", "turn off filter"]):
+        app_state.force_clothed = False
+        print(f"[nsfw-toggle] explicit command to enable NSFW - NSFW ENABLED")
+        return "enabled by explicit command"
+    
+    if any(cmd in text for cmd in ["disable nsfw", "enable filter", "turn on filter"]):
+        app_state.force_clothed = True
+        print(f"[nsfw-toggle] explicit command to disable NSFW - NSFW DISABLED")
+        return "disabled by explicit command"
+
+    # Simple NSFW triggers - any of these enables NSFW mode
+    nsfw_triggers = ["strip", "nude", "naked", "topless", "bottomless", "undress", "take off", 
+                     "remove clothes", "remove shirt", "remove dress", "remove top", "no panties", 
+                     "no bra", "show me naked", "expose", "bare", "uncovered"]
+    
+    for trigger in nsfw_triggers:
+        if trigger in text:
             app_state.force_clothed = False
-            print(f"[nsfw-toggle] matched explicit disable pattern: {pat} - NSFW ENABLED")
-            return "disabled by explicit user command"
-    for pat in explicit_enable:
-        if re.search(pat, text):
+            print(f"[nsfw-toggle] found NSFW trigger: '{trigger}' - NSFW ENABLED")
+            return "enabled by NSFW trigger"
+    
+    # Simple restore triggers - any of these disables NSFW mode
+    restore_triggers = ["get dressed", "put clothes on", "cover up", "dress up"]
+    
+    for trigger in restore_triggers:
+        if trigger in text:
             app_state.force_clothed = True
-            print(f"[nsfw-toggle] matched explicit enable pattern: {pat} - NSFW DISABLED")
-            return "enabled by explicit user command"
-
-    # Natural language triggers (allow nudity unless negated nearby)
-    natural_triggers = [r"\bstrip\b", r"\bundress\b", r"\btake off\b", r"\bremove clothes\b", r"\bno panties\b",
-                        r"\bbottomless\b", r"\bnaked\b", r"\bnude\b", r"\bbare\b", r"\bexpose\b", r"\bremove.*clothing\b", 
-                        r"\bremove.*shirt\b", r"\bremove.*dress\b", r"\bremove.*top\b", r"\btopless\b", r"\bno bra\b",
-                        r"\bshow me naked\b", r"\bshow.*nude\b", r"\bshow.*topless\b", r"\bwithout.*clothes\b", 
-                        r"\bwithout.*shirt\b", r"\bwithout.*top\b", r"\buncover\b", r"\bexposed\b"]
-    restore_phrases = [r"\bclothed\b", r"\bdress up\b", r"\bput clothes\b", r"\bget dressed\b", r"\bmodest\b", r"\bcovered\b"]
-
-    # Negation detection: look for negation words within a small window around the trigger
-    negation_words = [r"\bdo not\b", r"\bdon't\b", r"\bnever\b", r"\bnot\b", r"\bno\b"]
-
-    # Helper to detect trigger with no nearby negation (window of ~8 words)
-    def trigger_without_negation(patterns):
-        for pat in patterns:
-            for m in re.finditer(pat, text):
-                # Extract surrounding window
-                start, end = m.start(), m.end()
-                window_start = max(0, start - 80)
-                window_end = min(len(text), end + 80)
-                window = text[window_start:window_end]
-                matched_text = m.group()
-                print(f"[nsfw-toggle] found potential trigger: '{matched_text}' from pattern: {pat}")
-                if not any(re.search(n, window) for n in negation_words):
-                    print(f"[nsfw-toggle] trigger '{matched_text}' accepted (no negation found)")
-                    return True
-                else:
-                    print(f"[nsfw-toggle] trigger '{matched_text}' rejected (negation found in window)")
-        return False
-
-    if trigger_without_negation(natural_triggers):
-        app_state.force_clothed = False
-        print(f"[nsfw-toggle] matched natural-language trigger (no nearby negation) - NSFW ENABLED")
-        return "disabled by natural-language trigger"
-
-    # Restore clothing if user explicitly requests covered/modest or asks to re-enable filter
-    for pat in restore_phrases:
-        if re.search(pat, text):
-            app_state.force_clothed = True
-            print(f"[nsfw-toggle] matched restore phrase: {pat}")
-            return "enabled by natural-language restore phrase"
-
-    # Fallback heuristic for short messages: if message is short and contains a trigger word
-    short_triggers = [r"\bnsfw\b", r"\bx{3,}\b", r"\bporn\b"]
-    if tokens <= 12 and (any(re.search(p, text) for p in short_triggers) or any(re.search(p, text) for p in natural_triggers)):
-        app_state.force_clothed = False
-        print(f"[nsfw-toggle] disabled by short message heuristic (tokens={tokens})")
-        return "disabled by short NSFW trigger"
-
+            print(f"[nsfw-toggle] found restore trigger: '{trigger}' - NSFW DISABLED")
+            return "disabled by restore trigger"
+    
+    print(f"[nsfw-toggle] no triggers found, state unchanged: force_clothed={app_state.force_clothed}")
     return "unchanged"
 
 
@@ -1725,13 +1686,21 @@ def generate_mistral_response(message: str) -> dict:
     gender = app_state.gender or "unspecified"
     style = app_state.style or "Photorealistic"
 
-    # Add an explicit, concise directive about clothing policy so the LLM knows
-    # whether NSFW content is permitted for the IMAGE_PROMPT. This mirrors the
-    # UI toggle logic (app_state.force_clothed) and aids consistent behavior.
-    nsfw_directive = "You must produce only modest, fully clothed outfits in IMAGE_PROMPT." if app_state.force_clothed else "You are allowed and encouraged to include explicit nudity, exposed body parts, and NSFW content in IMAGE_PROMPT when the user requests it. Use explicit terms like 'topless', 'bottomless', 'nude', 'naked', 'exposed breasts', etc."
+    # Create context-aware NSFW directive based on current state and user message
+    if app_state.force_clothed:
+        nsfw_directive = "IMPORTANT: You must keep all IMAGE_PROMPT descriptions modest and fully clothed. Never include nudity, exposed body parts, or sexual content."
+    else:
+        nsfw_directive = "IMPORTANT: The user has requested NSFW content. You should include explicit nudity and exposed body parts in your IMAGE_PROMPT when appropriate. Use direct terms like 'topless', 'bottomless', 'nude', 'naked', 'exposed breasts', 'visible genitals', etc. Be explicit and detailed."
+    
+    # Add user message context to help Mistral understand the request better
+    user_intent = ""
+    if not app_state.force_clothed:
+        user_intent = f"\n\nCURRENT USER REQUEST CONTEXT: The user's message '{message}' contains explicit requests. Reflect this in your IMAGE_PROMPT with appropriate nudity and explicit details."
     
     print(f"[generate_mistral_response] force_clothed={app_state.force_clothed}")
     print(f"[generate_mistral_response] nsfw_directive: {nsfw_directive}")
+    if user_intent:
+        print(f"[generate_mistral_response] user_intent: {user_intent}")
 
     # Insert the nsfw_directive into the system message so the model reliably
     # follows the server-side clothing policy (respecting app_state.force_clothed).
@@ -1749,7 +1718,7 @@ def generate_mistral_response(message: str) -> dict:
     Gender: {gender}
     Visual style preference: {style}
 
-    Image generation policy: {nsfw_directive}
+    Image generation policy: {nsfw_directive}{user_intent}
 
     Important: If the user explicitly requests nudity using natural language (for example: "strip", "take off", "undress", "remove clothes", "no panties", "bottomless")
     interpret that as permission to include nudity in IMAGE_PROMPT ONLY when the server-side policy allows it (Image generation policy above).
