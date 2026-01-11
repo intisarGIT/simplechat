@@ -1114,6 +1114,14 @@ def generate_image(prompt, seed=None):
         print(f"INITIAL PROMPT: {prompt}")
         print(f"SEED VALUE: {seed if seed is not None else 'None (random)'}")
         print("====================================")
+        
+        # Early check: skip if prompt is 'none'
+        cleaned_check = prompt.strip().lower()
+        cleaned_check = re.sub(r'^\*+\s*', '', cleaned_check)
+        cleaned_check = re.sub(r'\s*\*+$', '', cleaned_check)
+        if cleaned_check == "none" or cleaned_check.startswith("image_prompt: none"):
+            print("Skipping image generation: prompt is 'none'")
+            return None, "Image prompt was 'none' — skipping image generation"
 
         # Check cache (use prompt+seed as key)
         cache_key = f"{prompt}_{seed}" if seed is not None else prompt
@@ -2657,12 +2665,25 @@ def create_ui(launch: bool = True):
                     if history is None:
                         history = []
 
-                    # Normalize incoming history to list of message dicts
-                    normalized = _normalize_chat_history(history)
+                    # Normalize incoming history to list of tuples (user, assistant)
+                    # Gradio Chatbot expects tuples, not role/content dicts
+                    if not history:
+                        normalized_pairs = []
+                    elif all(isinstance(m, (list, tuple)) and len(m) >= 2 for m in history):
+                        normalized_pairs = list(history)
+                    else:
+                        # Convert if needed
+                        normalized_pairs = []
+                        for item in history:
+                            if isinstance(item, dict) and 'role' in item:
+                                # Skip, we'll rebuild from app_state
+                                continue
+                            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                                normalized_pairs.append(tuple(item))
 
                     # Handle empty messages
                     if not message:
-                        return history, "", None, "No message sent", []
+                        return normalized_pairs, "", None, "No message sent", []
 
                     try:
                         # Call local Mistral wrapper directly (no HTTP needed)
@@ -2670,9 +2691,8 @@ def create_ui(launch: bool = True):
                         response_text = resp.get("chat_response", "No response received")
                         image_prompt = resp.get("image_prompt", "none")
 
-                        # Append to normalized history as role/content dicts
-                        normalized.append({"role": "user", "content": message})
-                        normalized.append({"role": "assistant", "content": response_text})
+                        # Append as tuple pair (user, assistant) for Gradio Chatbot
+                        normalized_pairs.append((message, response_text))
 
                         image_display = None
                         image_message = None
@@ -2701,16 +2721,13 @@ def create_ui(launch: bool = True):
                             if p and os.path.exists(os.path.join(OUTPUT_DIR, p)):
                                 gallery_items.append(os.path.join(OUTPUT_DIR, p))
 
-                        # Convert flat message dicts back to gr.Chatbot pairs
-                        pairs = messages_to_pairs(normalized)
-                        return pairs, "", image_display, image_message or "No image generated", gallery_items
+                        # Return tuple pairs directly for Gradio Chatbot
+                        return normalized_pairs, "", image_display, image_message or "No image generated", gallery_items
 
                     except Exception as e:
-                        # On error, append an assistant error message and return pairs
-                        normalized.append({"role": "user", "content": message})
-                        normalized.append({"role": "assistant", "content": f"Error: {str(e)}"})
-                        pairs = messages_to_pairs(normalized)
-                        return pairs, "", None, f"Error: {str(e)}", []
+                        # On error, append error as tuple and return
+                        normalized_pairs.append((message, f"Error: {str(e)}"))
+                        return normalized_pairs, "", None, f"Error: {str(e)}", []
 
                 def clear_chat_history():
                     try:
