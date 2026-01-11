@@ -1632,7 +1632,7 @@ def generate_mistral_response(message: str) -> dict:
     
     print(f"[Character Info] Using: {char_name} - {appearance[:30]}...")
     print(f"[Memory Management] Total messages in history: {len(app_state.conversation_messages)}")
-    print(f"[Memory Management] System message length: {len(system_message)} chars")
+    # System message not yet constructed here; defer length logging until after assignment
 
 
     # Create persistent character directive with all key details
@@ -1712,6 +1712,7 @@ def generate_mistral_response(message: str) -> dict:
         system_message = base_system
     
     print(f"[System Message] Generated system message for {char_name}")
+    print(f"[Memory Management] System message length: {len(system_message)} chars")
     
     # Add user message to conversation history (like app.py)
     user_message = {"role": "user", "content": message}
